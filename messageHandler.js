@@ -1,7 +1,7 @@
 /**
  * ====================================================================
  * AXA XYZ MESSAGE HANDLER & FINANCIAL AI ENGINE
- * Author      : Axa Xyz Engineering
+ * Author      : Axa Xyz Engineering (by Zettbos)
  * Environment : Railway / Node.js 18+ / CommonJS
  * File        : messageHandler.js
  * ====================================================================
@@ -50,6 +50,9 @@ const WALLET_MAP = {
   'LINKAJA': 'LinkAja'
 };
 
+/**
+ * Penanganan Pesan Masuk WhatsApp (Abaikan Grup Secara Mutlak)
+ */
 async function handleIncomingMessages(sock, chatUpdate) {
   if (chatUpdate.type !== 'notify') return;
 
@@ -58,7 +61,18 @@ async function handleIncomingMessages(sock, chatUpdate) {
     if (msg.key.fromMe) continue;
 
     const remoteJid = msg.key.remoteJid;
-    if (!remoteJid || remoteJid.endsWith('@broadcast') || remoteJid.includes('status@broadcast')) {
+
+    // ====================================================================
+    // FILTER ANTI-GRUP & BROADCAST MUTLAK:
+    // Abaikan seluruh pesan grup (@g.us), pesan berstatus participant, story, & broadcast
+    // ====================================================================
+    if (
+      !remoteJid ||
+      remoteJid.endsWith('@g.us') ||
+      remoteJid.endsWith('@broadcast') ||
+      remoteJid.includes('status@broadcast') ||
+      Boolean(msg.key.participant)
+    ) {
       continue;
     }
 
@@ -76,7 +90,7 @@ async function handleIncomingMessages(sock, chatUpdate) {
 
     textContent = (textContent || '').trim();
 
-    // Penanganan Pesan Berupa Media Gambar Struk Belanja
+    // Penanganan Pesan Berupa Media Gambar Struk Belanja (Khusus Chat Pribadi)
     if (messageType === 'imageMessage') {
       await simulateTyping(sock, remoteJid);
       await handleImageReceipt(sock, remoteJid, msg, textContent, pushName);
@@ -135,14 +149,13 @@ async function simulateTyping(sock, jid) {
     await delay(jitter);
     await sock.sendPresenceUpdate('paused', jid);
   } catch (presenceErr) {
-    // Non-fatal error
+    // Non-fatal
   }
 }
 
 function parseFinancialText(text) {
   if (!text || text.startsWith('!')) return null;
 
-  // Ekstraksi Tag Dompet (#bca, #tunai, #mandiri, #spay, dll)
   let wallet = 'Tunai';
   const walletTagMatch = text.match(/#([a-zA-Z0-9_]+)/);
   if (walletTagMatch) {
@@ -150,10 +163,8 @@ function parseFinancialText(text) {
     wallet = WALLET_MAP[rawTag] || rawTag;
   }
 
-  // Hapus tag pagar dari teks kerja
   let workingText = text.replace(/#[a-zA-Z0-9_]+/g, '').trim();
 
-  // Deteksi Tipe Transaksi (Pemasukan vs Pengeluaran)
   let type = 'Pengeluaran';
   const isIncomePrefix = workingText.startsWith('+');
   const lowerText = workingText.toLowerCase();
@@ -168,10 +179,8 @@ function parseFinancialText(text) {
     type = 'Pemasukan';
   }
 
-  // Bersihkan tanda plus / minus di awal teks
   workingText = workingText.replace(/^[+\-]\s*/, '').trim();
 
-  // Regex Nominal Moneter (mendukung k, rb, ribu, jt, juta)
   const amountRegex = /(\d+(?:[.,]\d+)?)\s*(k|rb|jt|ribu|juta)?/i;
   const match = workingText.match(amountRegex);
 
@@ -190,14 +199,12 @@ function parseFinancialText(text) {
   const amount = Math.round(rawNumber * multiplier);
   if (isNaN(amount) || amount <= 0) return null;
 
-  // Ekstraksi deskripsi transaksi
   let description = workingText.replace(match[0], '').trim();
   description = description.replace(/^(\s*untuk|\s*beli|\s*bayar|\s*dari)\s*/i, '').trim();
   if (!description) {
     description = type === 'Pemasukan' ? 'Pemasukan Kas' : 'Pengeluaran Umum';
   }
 
-  // Klasifikasi Kategori Finansial Otomatis
   let category = 'Operasional';
   const descLower = description.toLowerCase();
   if (type === 'Pemasukan') {
@@ -241,8 +248,8 @@ async function handleSaveFinancialText(sock, remoteJid, parsedTrx, pushName) {
     note: `Input via WhatsApp Chat (#${parsedTrx.wallet})`
   };
 
-  // Sinkronisasi asinkron ke Google Apps Script
-  syncToGAS(payload);
+  // Sinkronisasi data ke Google Sheets
+  await syncToGAS(payload);
 
   // Daftarkan transaksi ke memori Undo (5 menit)
   undoCache.set(remoteJid, {
@@ -311,7 +318,8 @@ async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
       mimeType
     };
 
-    syncToGAS(payload);
+    // Sinkronisasi data struk langsung ke Google Apps Script (Sheet Financial_Trx & Google Drive)
+    await syncToGAS(payload);
 
     undoCache.set(remoteJid, {
       trxId,
@@ -360,7 +368,7 @@ async function callGeminiOCRWithFallback(base64Image, mimeType) {
   for (const model of GEMINI_MODELS_CASCADE) {
     try {
       console.log(`[AxaBOT] Mengirim request Gemini OCR menggunakan model: ${model}`);
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+      const endpoint = `[https://generativelanguage.googleapis.com/v1beta/models/$](https://generativelanguage.googleapis.com/v1beta/models/$){encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
       const requestBody = {
         contents: [
@@ -414,7 +422,7 @@ async function handleAiFinancialAdvice(sock, remoteJid, userQuestion) {
       'Berikan jawaban singkat, praktis, ramah, dan solutif (maksimal 3 paragraf) untuk pertanyaan pemilik toko berikut:\n\n' +
       userQuestion;
 
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(DEFAULT_GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    const endpoint = `[https://generativelanguage.googleapis.com/v1beta/models/$](https://generativelanguage.googleapis.com/v1beta/models/$){encodeURIComponent(DEFAULT_GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
     const response = await axios.post(endpoint, {
       contents: [{ parts: [{ text: prompt }] }]
@@ -462,7 +470,7 @@ async function handleQuickUndo(sock, remoteJid) {
 
   undoCache.delete(remoteJid);
 
-  syncToGAS({
+  await syncToGAS({
     action: 'cancelTransaction',
     trxId: cached.trxId
   });
@@ -487,7 +495,7 @@ async function handleCheckBalance(sock, remoteJid) {
 
     const response = await axios.get(GAS_WEBAPP_URL, {
       params: { action: 'getBalanceSummary', senderNumber: remoteJid.split('@')[0] },
-      timeout: 8000
+      timeout: 10000
     });
 
     const data = response.data || {};
@@ -562,15 +570,22 @@ async function sendHelpMenu(sock, remoteJid) {
   await sock.sendMessage(remoteJid, { text: guide });
 }
 
+/**
+ * Sinkronisasi HTTP ke Google Apps Script dengan Log Transparan
+ */
 async function syncToGAS(payload) {
-  if (!GAS_WEBAPP_URL) return;
+  if (!GAS_WEBAPP_URL) {
+    console.warn('[AxaBOT GAS Sync] Variable GAS_WEBAPP_URL belum dikonfigurasi di Railway.');
+    return;
+  }
   try {
-    await axios.post(GAS_WEBAPP_URL, payload, {
+    const res = await axios.post(GAS_WEBAPP_URL, payload, {
       headers: { 'Content-Type': 'application/json' },
-      timeout: 15000
+      timeout: 20000
     });
+    console.log(`[AxaBOT GAS Sync Success] Action: ${payload.action} | Status:`, res.data);
   } catch (syncErr) {
-    console.error('[AxaBOT GAS Sync Error]', syncErr.message);
+    console.error('[AxaBOT GAS Sync Error]', syncErr.response ? syncErr.response.data : syncErr.message);
   }
 }
 
