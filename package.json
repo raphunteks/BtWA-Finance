@@ -1,0 +1,37 @@
+{
+  "name": "axaxyz-wa-financial-engine",
+  "version": "1.0.0",
+  "description": "WhatsApp Bot Engine Finansial Multi-Client Axa Xyz berbasis Baileys, Express, dan Google AI Studio Gemini untuk Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [
+    "baileys",
+    "whatsapp-bot",
+    "railway",
+    "gemini-ai",
+    "financial-tracker",
+    "axaxyz",
+    "google-apps-script"
+  ],
+  "author": "Axa Xyz by Zettbos",
+  "license": "ISC",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "axios": "^1.7.9",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
