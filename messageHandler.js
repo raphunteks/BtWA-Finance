@@ -4,19 +4,18 @@
  * Author      : Axa Xyz Engineering (by Zettbos)
  * Environment : Railway / Node.js 18+ / CommonJS
  * File        : messageHandler.js
+ * Feature     : Smart Inflow/Outflow OCR & Group Anti-Spam Isolation
  * ====================================================================
  */
 
 const { downloadMediaMessage, delay } = require('@whiskeysockets/baileys');
 const axios = require('axios');
 
-// Konfigurasi Model Google AI Studio (Model utama gemini-3.6-flash)
 const DEFAULT_GEMINI_MODEL = process.env.DEFAULT_GEMINI_MODEL || 'gemini-3.6-flash';
 const FALLBACK_GEMINI_MODEL = process.env.FALLBACK_GEMINI_MODEL || 'gemini-3.1-flash-lite';
 let cachedApiKey = (process.env.GEMINI_API_KEY || '').trim();
 const GAS_WEBAPP_URL = (process.env.GAS_WEBAPP_URL || '').trim();
 
-// Urutan Cascade Model AI Studio: Otomatis failover jika 429 atau timeout
 const GEMINI_MODELS_CASCADE = [
   DEFAULT_GEMINI_MODEL,
   'gemini-3.1-flash-lite',
@@ -26,11 +25,9 @@ const GEMINI_MODELS_CASCADE = [
   'gemini-3-flash'
 ];
 
-// In-Memory cache untuk Fitur Quick Undo Transaksi (Masa aktif: 5 menit)
 const undoCache = new Map();
 const UNDO_EXPIRATION_MS = 5 * 60 * 1000;
 
-// Kamus Normalisasi Tag Dompet Multi-Payment
 const WALLET_MAP = {
   'TUNAI': 'Tunai',
   'CASH': 'Tunai',
@@ -50,15 +47,11 @@ const WALLET_MAP = {
   'LINKAJA': 'LinkAja'
 };
 
-/**
- * Mengambil Kunci API Gemini Aktif (Environment Railway atau fallback ke Google Sheet GAS)
- */
 async function getEffectiveApiKey() {
   if (cachedApiKey && cachedApiKey.length > 10) {
     return cachedApiKey;
   }
 
-  // Fallback: Ambil API Key yang tersimpan di sheet Settings via endpoint GAS
   if (GAS_WEBAPP_URL) {
     try {
       const res = await axios.post(GAS_WEBAPP_URL, {
@@ -86,9 +79,6 @@ async function getEffectiveApiKey() {
   return cachedApiKey;
 }
 
-/**
- * Penanganan Pesan Masuk WhatsApp (Abaikan Grup Secara Mutlak)
- */
 async function handleIncomingMessages(sock, chatUpdate) {
   if (chatUpdate.type !== 'notify') return;
 
@@ -126,7 +116,7 @@ async function handleIncomingMessages(sock, chatUpdate) {
 
     textContent = (textContent || '').trim();
 
-    // Penanganan Pesan Berupa Media Gambar Struk Belanja (Khusus Chat Pribadi)
+    // Penanganan Pesan Berupa Media Gambar Struk / Bukti Transfer (Khusus Chat Pribadi)
     if (messageType === 'imageMessage') {
       await simulateTyping(sock, remoteJid);
       await handleImageReceipt(sock, remoteJid, msg, textContent, pushName);
@@ -137,21 +127,18 @@ async function handleIncomingMessages(sock, chatUpdate) {
 
     const lowerText = textContent.toLowerCase();
 
-    // Command: Bantuan / Menu
     if (lowerText === '!help' || lowerText === '!menu') {
       await simulateTyping(sock, remoteJid);
       await sendHelpMenu(sock, remoteJid);
       continue;
     }
 
-    // Command: Diagnostic Test Gemini API
     if (lowerText === '!test' || lowerText === '!ping') {
       await simulateTyping(sock, remoteJid);
       await handleTestGeminiApi(sock, remoteJid);
       continue;
     }
 
-    // Command: Tanya Gemini AI Lengkap (!tanya <pertanyaan> atau !ask <pertanyaan>)
     if (lowerText.startsWith('!tanya ') || lowerText.startsWith('!ask ')) {
       const userPrompt = textContent.replace(/^!(tanya|ask)\s+/i, '').trim();
       if (!userPrompt) {
@@ -165,28 +152,24 @@ async function handleIncomingMessages(sock, chatUpdate) {
       continue;
     }
 
-    // Command: Cek Saldo Multi-Dompet
     if (lowerText === '!saldo') {
       await simulateTyping(sock, remoteJid);
       await handleCheckBalance(sock, remoteJid);
       continue;
     }
 
-    // Command: Unduh Laporan PDF
     if (lowerText === '!rekap') {
       await simulateTyping(sock, remoteJid);
       await handleReportLink(sock, remoteJid);
       continue;
     }
 
-    // Command: Batalkan Transaksi Terakhir (Quick Undo)
     if (lowerText === '!batal' || lowerText === '!undo') {
       await simulateTyping(sock, remoteJid);
       await handleQuickUndo(sock, remoteJid);
       continue;
     }
 
-    // Parsing Format Transaksi Keuangan Teks
     const parsedTrx = parseFinancialText(textContent);
     if (parsedTrx) {
       await simulateTyping(sock, remoteJid);
@@ -194,7 +177,6 @@ async function handleIncomingMessages(sock, chatUpdate) {
       continue;
     }
 
-    // Jika pesan merupakan pertanyaan umum seputar keuangan, arahkan ke Asisten AI
     if (isFinancialQuestion(textContent)) {
       await simulateTyping(sock, remoteJid);
       await handleAiFinancialAdvice(sock, remoteJid, textContent);
@@ -214,9 +196,6 @@ async function simulateTyping(sock, jid) {
   }
 }
 
-/**
- * Uji Diagnostik Koneksi Google AI Studio (!test)
- */
 async function handleTestGeminiApi(sock, remoteJid) {
   const startTime = Date.now();
   const apiKey = await getEffectiveApiKey();
@@ -233,7 +212,6 @@ async function handleTestGeminiApi(sock, remoteJid) {
   const maskedKey = apiKey.length > 8 ? `${apiKey.substring(0, 6)}...${apiKey.substring(apiKey.length - 4)}` : 'Terdaftar';
 
   try {
-    // URL REST API bersih tanpa tag Markdown
     const testEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(DEFAULT_GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
     const response = await axios.post(
@@ -282,16 +260,12 @@ async function handleTestGeminiApi(sock, remoteJid) {
       `• *HTTP Status:* \`${httpStatus}\`\n` +
       `• *Pesan Error:* \`${errorDetails}\`\n` +
       `• *Kunci API Terdeteksi:* \`${maskedKey}\`\n` +
-      `• *Waktu Pengujian:* \`${latencyMs} ms\`\n\n` +
-      `💡 _Pastikan kuota API Key aktif di Google AI Studio dan format model didukung._`;
+      `• *Waktu Pengujian:* \`${latencyMs} ms\``;
 
     await sock.sendMessage(remoteJid, { text: failSummary });
   }
 }
 
-/**
- * Konsultasi Finansial & Tanya Jawab Komprehensif (!tanya <pertanyaan>)
- */
 async function handleAiComprehensiveQuestion(sock, remoteJid, userQuestion) {
   const apiKey = await getEffectiveApiKey();
 
@@ -315,7 +289,6 @@ async function handleAiComprehensiveQuestion(sock, remoteJid, userQuestion) {
 
     for (const model of GEMINI_MODELS_CASCADE) {
       try {
-        // Endpoint REST API murni tanpa formatting Markdown
         const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
         const response = await axios.post(
@@ -357,7 +330,7 @@ async function handleAiComprehensiveQuestion(sock, remoteJid, userQuestion) {
   } catch (err) {
     console.error('[AxaBOT Tanya AI Error]', err.message);
     await sock.sendMessage(remoteJid, {
-      text: `❌ *Gagal menjawab pertanyaan:* ${err.message}\nSilakan coba beberapa saat lagi atau gunakan perintah *!test* untuk cek status server.`
+      text: `❌ *Gagal menjawab pertanyaan:* ${err.message}`
     });
   }
 }
@@ -457,10 +430,8 @@ async function handleSaveFinancialText(sock, remoteJid, parsedTrx, pushName) {
     note: `Input via WhatsApp Chat (#${parsedTrx.wallet})`
   };
 
-  // Sinkronisasi data ke Google Sheets
   await syncToGAS(payload);
 
-  // Daftarkan transaksi ke memori Undo (5 menit)
   undoCache.set(remoteJid, {
     trxId,
     amount: parsedTrx.amount,
@@ -475,7 +446,7 @@ async function handleSaveFinancialText(sock, remoteJid, parsedTrx, pushName) {
   const replyMessage =
     `✅ *Transaksi Berhasil Dicatat!* ${emoji}\n\n` +
     `• *ID Trx:* \`${trxId}\`\n` +
-    `• *Jenis:* ${parsedTrx.type}\n` +
+    `• *Jenis:* *${parsedTrx.type}*\n` +
     `• *Keterangan:* ${parsedTrx.description}\n` +
     `• *Nominal:* *Rp ${parsedTrx.amount.toLocaleString('id-ID')}*\n` +
     `• *Dompet:* *${parsedTrx.wallet}*\n` +
@@ -488,7 +459,7 @@ async function handleSaveFinancialText(sock, remoteJid, parsedTrx, pushName) {
 
 async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
   try {
-    await sock.sendMessage(remoteJid, { text: '⏳ *Sedang memindai nota belanja dengan Gemini 3.6 Flash...*' });
+    await sock.sendMessage(remoteJid, { text: '⏳ *Sedang memindai gambar bukti/nota dengan Gemini 3.6 Flash...*' });
 
     const buffer = await downloadMediaMessage(msg, 'buffer', {});
     const base64Data = buffer.toString('base64');
@@ -501,15 +472,46 @@ async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
       wallet = WALLET_MAP[rawTag] || rawTag;
     }
 
+    // ====================================================================
+    // DETEKSI OVERRIDE TIPE TRANSAKSI DARI CAPTION PENGGUNA
+    // Mendukung: '+', 'masuk', 'pemasukan', 'omset', 'terima', '-' / 'keluar'
+    // ====================================================================
+    let forcedType = null;
+    const lowerCaption = (caption || '').toLowerCase().trim();
+    if (
+      lowerCaption.startsWith('+') ||
+      lowerCaption.includes('masuk') ||
+      lowerCaption.includes('pemasukan') ||
+      lowerCaption.includes('omset') ||
+      lowerCaption.includes('inflow') ||
+      lowerCaption.includes('terima')
+    ) {
+      forcedType = 'Pemasukan';
+    } else if (
+      lowerCaption.startsWith('-') ||
+      lowerCaption.includes('keluar') ||
+      lowerCaption.includes('pengeluaran') ||
+      lowerCaption.includes('outflow') ||
+      lowerCaption.includes('beli') ||
+      lowerCaption.includes('bayar')
+    ) {
+      forcedType = 'Pengeluaran';
+    }
+
+    // Jalankan OCR dengan prompt klasifikasi dua arah (Pemasukan vs Pengeluaran)
     const ocrResult = await callGeminiOCRWithFallback(base64Data, mimeType);
 
     const trxId = `TRX-${getFormattedDateId()}-${Math.floor(1000 + Math.random() * 9000)}`;
     const nowStr = formatFullDate(new Date());
 
     const amount = Number(ocrResult.amount) || 0;
-    const merchant = ocrResult.merchant || 'Struk Belanja Toko';
-    const category = ocrResult.category || 'Operasional';
-    const note = ocrResult.note || 'Struk hasil ekstraksi Gemini OCR';
+    const merchant = ocrResult.merchant || 'Pihak Transaksi';
+
+    // Tentukan Tipe Final: Prioritaskan override caption pengguna jika ada, jika tidak gunakan hasil deteksi cerdas AI
+    let finalType = forcedType || (ocrResult.type === 'Pemasukan' ? 'Pemasukan' : 'Pengeluaran');
+
+    let category = ocrResult.category || (finalType === 'Pemasukan' ? 'Penjualan / Pendapatan' : 'Operasional');
+    const note = ocrResult.note || ('Bukti gambar dianalisis Gemini (' + finalType + ')');
 
     const payload = {
       action: 'recordTransaction',
@@ -517,7 +519,7 @@ async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
       senderNumber: remoteJid.split('@')[0],
       senderName: pushName,
       date: ocrResult.date || nowStr.split(' ')[0],
-      type: 'Pengeluaran',
+      type: finalType,
       category,
       merchant,
       amount,
@@ -527,25 +529,27 @@ async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
       mimeType
     };
 
-    // Sinkronisasi data struk langsung ke Google Apps Script (Sheet Financial_Trx & Google Drive)
+    // Sinkronisasi data ke Google Sheets
     await syncToGAS(payload);
 
     undoCache.set(remoteJid, {
       trxId,
       amount,
-      type: 'Pengeluaran',
+      type: finalType,
       category,
       wallet,
       description: merchant,
       timestamp: Date.now()
     });
 
+    const emoji = finalType === 'Pemasukan' ? '📈' : '🧾';
     const replyMsg =
-      `🧾 *Nota Belanja Berhasil Dipindai AI!*\n\n` +
+      `${emoji} *Bukti Transaksi Berhasil Dipindai AI!*\n\n` +
       `• *ID Trx:* \`${trxId}\`\n` +
-      `• *Merchant:* *${merchant}*\n` +
-      `• *Tanggal Nota:* ${ocrResult.date || nowStr.split(' ')[0]}\n` +
-      `• *Total Belanja:* *Rp ${amount.toLocaleString('id-ID')}*\n` +
+      `• *Jenis:* *${finalType}*\n` +
+      `• *Pihak/Toko:* *${merchant}*\n` +
+      `• *Tanggal:* ${ocrResult.date || nowStr.split(' ')[0]}\n` +
+      `• *Nominal:* *Rp ${amount.toLocaleString('id-ID')}*\n` +
       `• *Metode Bayar:* *${wallet}*\n` +
       `• *Kategori:* ${category}\n` +
       `• *Ringkasan:* ${note}\n` +
@@ -557,7 +561,7 @@ async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
   } catch (ocrErr) {
     console.error('[AxaBOT OCR Error]', ocrErr.message);
     await sock.sendMessage(remoteJid, {
-      text: `❌ *Gagal memindai nota:* ${ocrErr.message}\nSilakan ketik *!test* untuk cek koneksi AI, atau input manual: _Beli barang 50k #tunai_`
+      text: `❌ *Gagal memindai gambar bukti:* ${ocrErr.message}\nSilakan input manual: _Beli barang 50k #tunai_ atau _+500k transfer project #bca_`
     });
   }
 }
@@ -569,10 +573,13 @@ async function callGeminiOCRWithFallback(base64Image, mimeType) {
     throw new Error('GEMINI_API_KEY belum dikonfigurasi pada environment Railway.');
   }
 
+  // Prompt cerdas: menganalisis apakah bukti ini transfer masuk (pemasukan) atau transfer keluar/nota (pengeluaran)
   const prompt =
-    'Analisis foto bukti struk belanja ini secara presisi dan objektif. ' +
+    'Analisis foto bukti transaksi/struk belanja/bukti transfer m-banking ini secara teliti dan presisi. ' +
+    'Tentukan apakah transaksi ini adalah "Pemasukan" (contoh: transfer masuk, dana diterima, kredit, top up diterima, penjualan) ' +
+    'atau "Pengeluaran" (contoh: pembayaran QRIS, struk belanja toko, transfer keluar, biaya admin, debit). ' +
     'Balas HANYA dalam format JSON valid tanpa tanda pembungkus markdown: ' +
-    '{"merchant": "nama toko", "date": "dd/MM/yyyy", "amount": 0, "category": "Kategori Pengeluaran (Bahan Baku/Operasional/Transport/Konsumsi/Lainnya)", "note": "ringkasan item singkat"}';
+    '{"merchant": "nama pihak/toko/pengirim", "date": "dd/MM/yyyy", "amount": 0, "type": "Pengeluaran atau Pemasukan", "category": "Kategori Transaksi (Operasional/Bahan Baku/Konsumsi/Transportasi/Penjualan / Pendapatan/Lainnya)", "note": "ringkasan transaksi singkat"}';
 
   let lastError = null;
 
@@ -580,7 +587,6 @@ async function callGeminiOCRWithFallback(base64Image, mimeType) {
     try {
       console.log(`[AxaBOT] Mengirim request Gemini OCR menggunakan model: ${model}`);
 
-      // URL murni tanpa karakter markdown link yang memicu "Invalid URL"
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
       const requestBody = {
@@ -636,7 +642,6 @@ async function handleAiFinancialAdvice(sock, remoteJid, userQuestion) {
       'Berikan jawaban singkat, praktis, ramah, dan solutif (maksimal 3 paragraf) untuk pertanyaan pemilik toko berikut:\n\n' +
       userQuestion;
 
-    // URL murni yang valid
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(DEFAULT_GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
     const response = await axios.post(endpoint, {
@@ -774,8 +779,10 @@ async function sendHelpMenu(sock, remoteJid) {
     `• _+500000 bonus project #jago_\n` +
     `• _Gaji 5000000 #bca_\n` +
     `• _Terima transfer 150000 #gopay_\n\n` +
-    `*3. Foto Struk Belanja:*\n` +
-    `• Kirim foto struk/nota dengan caption tag dompet (misal: _#bca_). AI Gemini 3.6 Flash akan membaca total dan nama toko otomatis!\n\n` +
+    `*3. Foto Struk Belanja / Bukti Transfer:*\n` +
+    `• *Pengeluaran:* Kirim foto struk belanja dengan tag dompet (misal: _#bca_).\n` +
+    `• *Pemasukan:* Kirim screenshot transfer masuk dengan caption awalan plus/masuk (misal: _+ omset toko #bca_ atau _masuk #mandiri_).\n` +
+    `• Gemini 3.6 Flash akan otomatis membaca nominal, tanggal, dan nama pihak pengirim/merchant!\n\n` +
     `*4. Perintah Cepat & AI:*\n` +
     `• *!test*   : Tes diagnostik koneksi Gemini AI & latensi\n` +
     `• *!tanya*  : Konsultasi finansial mendalam (*!tanya <soal>*)\n` +
@@ -787,9 +794,6 @@ async function sendHelpMenu(sock, remoteJid) {
   await sock.sendMessage(remoteJid, { text: guide });
 }
 
-/**
- * Sinkronisasi HTTP ke Google Apps Script dengan Log Transparan
- */
 async function syncToGAS(payload) {
   if (!GAS_WEBAPP_URL) {
     console.warn('[AxaBOT GAS Sync] Variable GAS_WEBAPP_URL belum dikonfigurasi di Railway.');
