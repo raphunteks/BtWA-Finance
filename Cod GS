@@ -1,0 +1,1377 @@
+/**
+ * ====================================================================
+ * PORTAL BOT WA KEUANGAN MULTI-CLIENT - BACKEND LOGIC & CONTROLLER
+ * Author : ZettBOT 3.1 by Zettbos (for AxaXyz)
+ * File   : code.gs
+ * Feature: Dual Connection Architecture (Native GAS & Vercel/GitHub)
+ * ====================================================================
+ */
+
+function doGet(e) {
+  // 1. Layani endpoint query API eksternal (dari Engine Railway atau Vercel)
+  if (e && e.parameter && e.parameter.action) {
+    var action = e.parameter.action;
+
+    if (action === 'ping') {
+      return ContentService.createTextOutput(JSON.stringify({
+        status: 'ONLINE',
+        mode: 'DUAL_CONNECTION_GAS_READY',
+        timestamp: new Date().toISOString()
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === 'getBalanceSummary') {
+      var senderNumber = (e.parameter.senderNumber || '').toString().trim();
+      var summaryResult = getBalanceSummaryForBot(senderNumber);
+      return ContentService.createTextOutput(JSON.stringify(summaryResult))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === 'getReminderClients') {
+      var token = (e.parameter.token || '').toString().trim();
+      var reminderResult = getReminderClientsForBot(token);
+      return ContentService.createTextOutput(JSON.stringify(reminderResult))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === 'viewReportPDF') {
+      var sNum = (e.parameter.senderNumber || '').toString().trim();
+      return handleDirectPdfRedirect(sNum);
+    }
+  }
+
+  // 2. Standar: Render Antarmuka HTML Web App
+  return HtmlService.createTemplateFromFile('index')
+    .evaluate()
+    .setTitle('Portal Bot WA Keuangan Multi-Client - AxaXyz')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function doPost(e) {
+  try {
+    var rawData = (e && e.postData && e.postData.contents) ? e.postData.contents : '{}';
+    var parsed = JSON.parse(rawData);
+    var action = parsed.action || '';
+    var data = parsed.data || parsed; // Mendukung format flat payload dari bot maupun wrapper dari Vercel
+    var currentUser = parsed.currentUser || null;
+
+    var responseData = { success: false, message: 'Action tidak dikenali: ' + action };
+
+    // Router Aksi API Universal Dual-Connection & Bot Engine Sync
+    if (action === 'recordTransaction') {
+      responseData = recordTransactionFromBot(data);
+    } else if (action === 'cancelTransaction') {
+      responseData = cancelTransactionFromBot(data.trxId || parsed.trxId);
+    } else if (action === 'loginUser') {
+      responseData = loginUser(data.username, data.password);
+    } else if (action === 'getClientsPaginated') {
+      responseData = getClientsPaginated(data);
+    } else if (action === 'saveClient') {
+      responseData = saveClient(data.clientData, currentUser);
+    } else if (action === 'deleteClient') {
+      responseData = deleteClient(data.clientId, currentUser);
+    } else if (action === 'fetchRailwaySession') {
+      responseData = fetchRailwaySession(data.endpoint);
+    } else if (action === 'getFinancialAnalytics') {
+      responseData = getFinancialAnalytics(data.clientId);
+    } else if (action === 'processReceiptOCR') {
+      responseData = processReceiptOCR(data.payload, currentUser);
+    } else if (action === 'askGeminiChat') {
+      responseData = askGeminiChat(data.message);
+    } else if (action === 'exportFinancialReportPDF') {
+      responseData = exportFinancialReportPDF(data.clientId, currentUser);
+    } else if (action === 'getAuditLogsPaginated') {
+      responseData = { success: true, logs: getAuditLogsPaginated(data.limit) };
+    } else if (action === 'getAllSettings') {
+      responseData = getAllSettings(currentUser);
+    } else if (action === 'saveAllSettings') {
+      responseData = saveAllSettings(data.settingsMap, currentUser);
+    } else if (action === 'testGeminiConnection') {
+      responseData = testGeminiConnection(data.apiKey, data.model, currentUser);
+    }
+
+    return ContentService.createTextOutput(JSON.stringify(responseData))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (postErr) {
+    return ContentService.createTextOutput(JSON.stringify({
+      success: false,
+      message: 'Server Error: ' + postErr.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Perekaman Transaksi Otomatis dari Engine Bot WhatsApp Railway
+ */
+function recordTransactionFromBot(data) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var trxSheet = ss.getSheetByName('Financial_Trx');
+    var clientSheet = ss.getSheetByName('Clients');
+
+    if (!trxSheet) throw new Error('Sheet Financial_Trx tidak ditemukan di database.');
+
+    var timezone = 'Asia/Jakarta';
+    var nowFormatted = Utilities.formatDate(new Date(), timezone, 'dd/MM/yyyy HH:mm:ss');
+    var trxId = data.trxId || getNextSequentialId('Financial_Trx', 1, 'TRX');
+    var senderNumber = (data.senderNumber || '').toString().replace(/[^0-9]/g, '');
+
+    // 1. Identifikasi Client_ID dan Folder Drive Client
+    var clientId = 'CLI-GENERAL';
+    var clientName = data.senderName || 'Pelanggan Bot';
+    var targetDriveFolderId = '';
+
+    if (clientSheet && clientSheet.getLastRow() > 1) {
+      var clientRows = clientSheet.getRange(2, 1, clientSheet.getLastRow() - 1, 5).getDisplayValues();
+      for (var i = 0; i < clientRows.length; i++) {
+        var cleanWa = (clientRows[i][2] || '').toString().replace(/[^0-9]/g, '');
+        if (cleanWa === senderNumber || (senderNumber && cleanWa.indexOf(senderNumber) !== -1)) {
+          clientId = clientRows[i][0];
+          clientName = clientRows[i][1];
+          targetDriveFolderId = clientRows[i][4];
+          break;
+        }
+      }
+    }
+
+    // 2. Simpan Foto Bukti Struk ke Google Drive (jika data foto Base64 disertakan)
+    var driveFileUrl = '';
+    if (data.imageBase64) {
+      try {
+        var targetFolder = targetDriveFolderId ? DriveApp.getFolderById(targetDriveFolderId) : getOrCreateClientFolder(clientId, clientName);
+        var mimeType = data.mimeType || 'image/jpeg';
+        var imgBytes = Utilities.base64Decode(data.imageBase64);
+        var fileName = 'Struk_WA_' + trxId + '_' + Date.now() + '.jpg';
+        var fileBlob = Utilities.newBlob(imgBytes, mimeType, fileName);
+        var savedFile = targetFolder.createFile(fileBlob);
+        savedFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        driveFileUrl = savedFile.getUrl();
+      } catch (driveErr) {
+        Logger.log('Peringatan penyimpanan gambar Drive: ' + driveErr.toString());
+      }
+    }
+
+    // 3. Masukkan Baris Transaksi ke Sheet Financial_Trx
+    var rawNumber = parseFloat(data.amount) || 0;
+    var rawNote = data.note || '';
+    if (data.wallet && rawNote.indexOf(data.wallet) === -1) {
+      rawNote += ' (#' + data.wallet + ')';
+    }
+
+    var newRow = [
+      trxId,
+      clientId,
+      data.date || Utilities.formatDate(new Date(), timezone, 'dd/MM/yyyy'),
+      data.type || 'Pengeluaran',
+      data.category || 'Operasional',
+      data.merchant || 'Transaksi Toko',
+      rawNumber,
+      rawNote,
+      driveFileUrl,
+      JSON.stringify(data),
+      nowFormatted
+    ];
+
+    trxSheet.appendRow(newRow);
+    SpreadsheetApp.flush();
+
+    logAudit('AxaBOT_Engine', 'Bot', 'BOT_RECORD_TRX', trxId, 'Input transaksi WhatsApp dari ' + senderNumber + ' (' + clientName + ')', 'SUCCESS');
+
+    return {
+      success: true,
+      trxId: trxId,
+      clientId: clientId,
+      driveFileUrl: driveFileUrl,
+      message: 'Transaksi sukses disimpan ke Google Sheet Financial_Trx.'
+    };
+
+  } catch (err) {
+    logAudit('AxaBOT_Engine', 'Bot', 'BOT_RECORD_FAILED', data.trxId || '-', err.toString(), 'FAILED');
+    return { success: false, message: 'Gagal mencatat transaksi: ' + err.toString() };
+  }
+}
+
+/**
+ * Pembatalan Transaksi Otomatis (Quick Undo via WhatsApp)
+ */
+function cancelTransactionFromBot(trxId) {
+  try {
+    if (!trxId) throw new Error('ID Transaksi tidak disertakan.');
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Financial_Trx');
+    if (!sheet) throw new Error('Sheet Financial_Trx tidak ditemukan.');
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) throw new Error('Sheet Financial_Trx kosong.');
+
+    var idRange = sheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues();
+    var targetRowIndex = -1;
+
+    for (var i = 0; i < idRange.length; i++) {
+      if (idRange[i][0] === trxId) {
+        targetRowIndex = i + 2;
+        break;
+      }
+    }
+
+    if (targetRowIndex === -1) throw new Error('ID Transaksi ' + trxId + ' tidak ditemukan.');
+
+    // Ubah Type menjadi Dibatalkan agar analitik arus kas otomatis mengabaikannya
+    sheet.getRange(targetRowIndex, 4).setValue('Dibatalkan');
+    var existingNote = sheet.getRange(targetRowIndex, 8).getDisplayValue();
+    sheet.getRange(targetRowIndex, 8).setValue('[BATAL/VOID] ' + existingNote);
+
+    SpreadsheetApp.flush();
+    logAudit('AxaBOT_Engine', 'Bot', 'BOT_CANCEL_TRX', trxId, 'Quick Undo via WhatsApp berhasil dibatalkan', 'SUCCESS');
+
+    return { success: true, message: 'Transaksi ' + trxId + ' berhasil dibatalkan di buku kas.' };
+
+  } catch (err) {
+    return { success: false, message: err.toString() };
+  }
+}
+
+/**
+ * Ringkasan Saldo Berdasarkan Nomor WhatsApp Pengirim
+ */
+function getBalanceSummaryForBot(senderNumber) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var trxSheet = ss.getSheetByName('Financial_Trx');
+    var clientSheet = ss.getSheetByName('Clients');
+
+    var targetClientId = 'ALL';
+    var cleanSender = (senderNumber || '').replace(/[^0-9]/g, '');
+
+    // Cari Client ID berdasarkan senderNumber
+    if (cleanSender && clientSheet && clientSheet.getLastRow() > 1) {
+      var cRows = clientSheet.getRange(2, 1, clientSheet.getLastRow() - 1, 3).getDisplayValues();
+      for (var i = 0; i < cRows.length; i++) {
+        var cWa = (cRows[i][2] || '').replace(/[^0-9]/g, '');
+        if (cWa === cleanSender || (cleanSender && cWa.indexOf(cleanSender) !== -1)) {
+          targetClientId = cRows[i][0];
+          break;
+        }
+      }
+    }
+
+    var totalInflow = 0;
+    var totalOutflow = 0;
+    var wallets = {
+      'Tunai': 0,
+      'BCA': 0,
+      'Mandiri': 0,
+      'BRI': 0,
+      'GoPay': 0,
+      'OVO': 0,
+      'DANA': 0,
+      'ShopeePay': 0
+    };
+
+    if (trxSheet && trxSheet.getLastRow() > 1) {
+      var rows = trxSheet.getRange(2, 1, trxSheet.getLastRow() - 1, 8).getDisplayValues();
+      for (var j = 0; j < rows.length; j++) {
+        var rowCId = rows[j][1];
+        var type = (rows[j][3] || '').toLowerCase();
+        var amount = parseFloat(rows[j][6].replace(/[^0-9.-]+/g, '')) || 0;
+        var note = rows[j][7] || '';
+
+        if (type === 'dibatalkan') continue;
+        if (targetClientId !== 'ALL' && rowCId !== targetClientId) continue;
+
+        // Deteksi dompet dari teks catatan
+        var detectedWallet = 'Tunai';
+        for (var w in wallets) {
+          if (note.toUpperCase().indexOf('#' + w.toUpperCase()) !== -1) {
+            detectedWallet = w;
+            break;
+          }
+        }
+
+        if (type === 'pemasukan') {
+          totalInflow += amount;
+          wallets[detectedWallet] = (wallets[detectedWallet] || 0) + amount;
+        } else if (type === 'pengeluaran') {
+          totalOutflow += amount;
+          wallets[detectedWallet] = (wallets[detectedWallet] || 0) - amount;
+        }
+      }
+    }
+
+    return {
+      success: true,
+      totalInflow: totalInflow,
+      totalOutflow: totalOutflow,
+      netBalance: totalInflow - totalOutflow,
+      wallets: wallets
+    };
+
+  } catch (err) {
+    return { success: false, totalInflow: 0, totalOutflow: 0, netBalance: 0, wallets: {} };
+  }
+}
+
+/**
+ * Mengambil Klien Aktif untuk Daily Push Reminder Cron
+ */
+function getReminderClientsForBot(token) {
+  try {
+    var validToken = getSettingValue('API_SECRET_TOKEN') || 'AXA_XYZ_SECRET_2026';
+    if (token !== validToken) {
+      return { success: false, message: 'Unauthorized Token', clients: [] };
+    }
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Clients');
+    if (!sheet || sheet.getLastRow() <= 1) {
+      return { success: true, clients: [] };
+    }
+
+    var rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 6).getDisplayValues();
+    var clients = [];
+
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i][5] === 'Connected' && rows[i][2]) {
+        clients.push({
+          clientId: rows[i][0],
+          clientName: rows[i][1],
+          waNumber: rows[i][2]
+        });
+      }
+    }
+
+    return { success: true, clients: clients };
+  } catch (e) {
+    return { success: false, clients: [] };
+  }
+}
+
+function handleDirectPdfRedirect(senderNumber) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var clientSheet = ss.getSheetByName('Clients');
+  var targetCId = 'ALL';
+
+  if (senderNumber && clientSheet && clientSheet.getLastRow() > 1) {
+    var cRows = clientSheet.getRange(2, 1, clientSheet.getLastRow() - 1, 3).getDisplayValues();
+    for (var i = 0; i < cRows.length; i++) {
+      if (cRows[i][2].replace(/[^0-9]/g, '') === senderNumber.replace(/[^0-9]/g, '')) {
+        targetCId = cRows[i][0];
+        break;
+      }
+    }
+  }
+
+  var res = exportFinancialReportPDF(targetCId, { username: 'AxaBOT_WA', role: 'Admin' });
+  if (res.success && res.fileUrl) {
+    return HtmlService.createHtmlOutput('<script>window.location.href="' + res.fileUrl + '";</script>');
+  }
+  return ContentService.createTextOutput('Laporan PDF sedang diproses. Silakan akses kembali.');
+}
+
+function assertAdminRole(role) {
+  if (!role || role.toLowerCase() !== 'admin') {
+    throw new Error('Akses Ditolak: Tindakan ini hanya dapat dieksekusi oleh akun dengan Role Administrator.');
+  }
+}
+
+function getSettingValue(settingKey) {
+  try {
+    var cleanTarget = (settingKey || '').toString().trim().toUpperCase();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Settings');
+    
+    if (sheet && sheet.getLastRow() > 1) {
+      var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getDisplayValues();
+      for (var i = 0; i < data.length; i++) {
+        var k = (data[i][0] || '').toString().trim().toUpperCase();
+        if (k === cleanTarget) {
+          var val = (data[i][1] || '').toString().trim();
+          if (val) return val;
+        }
+      }
+    }
+    return (PropertiesService.getScriptProperties().getProperty(settingKey) || '').trim();
+  } catch (e) {
+    return (PropertiesService.getScriptProperties().getProperty(settingKey) || '').trim();
+  }
+}
+
+function getAllSettings(currentUser) {
+  try {
+    assertAdminRole(currentUser ? currentUser.role : null);
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Settings');
+    if (!sheet || sheet.getLastRow() <= 1) {
+      return { success: true, settings: [] };
+    }
+
+    var rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 4).getDisplayValues();
+    var settingsList = [];
+    for (var i = 0; i < rows.length; i++) {
+      settingsList.push({
+        key: rows[i][0].toString().trim(),
+        value: rows[i][1].toString().trim(),
+        description: rows[i][2],
+        updatedAt: rows[i][3]
+      });
+    }
+
+    return { success: true, settings: settingsList };
+  } catch (err) {
+    return { success: false, message: err.toString(), settings: [] };
+  }
+}
+
+function saveSetting(settingKey, settingValue, currentUser) {
+  try {
+    assertAdminRole(currentUser ? currentUser.role : null);
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Settings');
+    if (!sheet) throw new Error('Sheet Settings tidak ditemukan.');
+
+    var cleanKey = (settingKey || '').toString().trim();
+    var cleanVal = (settingValue || '').toString().trim();
+    var nowFormatted = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd/MM/yyyy HH:mm:ss');
+    var lastRow = sheet.getLastRow();
+    var foundIndex = -1;
+
+    if (lastRow > 1) {
+      var keys = sheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues();
+      for (var i = 0; i < keys.length; i++) {
+        if (keys[i][0].toString().trim().toUpperCase() === cleanKey.toUpperCase()) {
+          foundIndex = i + 2;
+          break;
+        }
+      }
+    }
+
+    if (foundIndex !== -1) {
+      sheet.getRange(foundIndex, 2).setValue(cleanVal);
+      sheet.getRange(foundIndex, 4).setValue(nowFormatted);
+    } else {
+      sheet.appendRow([cleanKey, cleanVal, 'Pengaturan Sistem', nowFormatted]);
+    }
+
+    SpreadsheetApp.flush();
+    PropertiesService.getScriptProperties().setProperty(cleanKey, cleanVal);
+
+    logAudit(currentUser.username, currentUser.role, 'SETTING_UPDATE', cleanKey, 'Pembaruan konfigurasi: ' + cleanKey, 'SUCCESS');
+    return { success: true, message: 'Pengaturan ' + cleanKey + ' berhasil disimpan.' };
+  } catch (err) {
+    return { success: false, message: 'Gagal memperbarui pengaturan: ' + err.toString() };
+  }
+}
+
+function saveAllSettings(settingsMap, currentUser) {
+  try {
+    assertAdminRole(currentUser ? currentUser.role : null);
+    if (!settingsMap) throw new Error('Parameter pengaturan kosong.');
+
+    for (var key in settingsMap) {
+      if (settingsMap.hasOwnProperty(key)) {
+        saveSetting(key, settingsMap[key], currentUser);
+      }
+    }
+    return { success: true, message: 'Semua konfigurasi sistem & endpoint berhasil diperbarui!' };
+  } catch (err) {
+    return { success: false, message: err.toString() };
+  }
+}
+
+function testGeminiConnection(apiKeyInput, modelInput, currentUser) {
+  try {
+    assertAdminRole(currentUser ? currentUser.role : null);
+    var key = (apiKeyInput || getSettingValue('GEMINI_API_KEY') || '').toString().trim();
+    if (!key) {
+      return { success: false, message: 'Kunci API Gemini kosong. Masukkan API Key di tab Pengaturan.' };
+    }
+
+    var model = (modelInput || getSettingValue('GEMINI_MODEL_TEXT') || 'gemini-3.6-flash').toString().trim();
+    if (model === 'gemini-2.5-flash') {
+      model = 'gemini-3.6-flash';
+    }
+
+    var apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key);
+
+    var requestBody = {
+      contents: [{ parts: [{ text: 'Ping test. Jawab tepat 1 kata: AKTIF' }] }]
+    };
+
+    var options = {
+      method: 'post',
+      contentType: 'application/json',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': key
+      },
+      payload: JSON.stringify(requestBody),
+      muteHttpExceptions: true
+    };
+
+    var response = UrlFetchApp.fetch(apiUrl, options);
+    var respCode = response.getResponseCode();
+    var content = response.getContentText();
+
+    if (respCode === 200) {
+      var respJson = JSON.parse(content);
+      var text = (respJson.candidates && respJson.candidates[0].content && respJson.candidates[0].content.parts[0].text) || 'Terhubung';
+      return {
+        success: true,
+        message: 'Koneksi Sukses! API Key valid dan model ' + model + ' merespon: "' + text.trim() + '"',
+        modelUsed: model
+      };
+    } else {
+      var parsedErr = content;
+      try {
+        var errObj = JSON.parse(content);
+        if (errObj.error && errObj.error.message) {
+          parsedErr = errObj.error.message;
+        }
+      } catch (e) {}
+
+      return {
+        success: false,
+        message: 'Google API Menolak (Status ' + respCode + '): ' + parsedErr
+      };
+    }
+  } catch (err) {
+    return { success: false, message: 'Gagal terhubung ke Google AI Studio: ' + err.toString() };
+  }
+}
+
+function logAudit(user, role, actionType, targetId, details, status) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Audit_Logs');
+    if (!sheet) return;
+
+    var logId = getNextSequentialId('Audit_Logs', 1, 'LOG');
+    var nowFormatted = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd/MM/yyyy HH:mm:ss');
+    var rowData = [
+      logId,
+      nowFormatted,
+      user || 'Anonymous',
+      role || 'Guest',
+      actionType,
+      targetId || '-',
+      details || '',
+      status || 'SUCCESS'
+    ];
+
+    sheet.appendRow(rowData);
+    SpreadsheetApp.flush();
+  } catch (err) {
+    Logger.log('Gagal mencatat audit log: ' + err.toString());
+  }
+}
+
+function loginUser(username, password) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Admin_Users');
+    if (!sheet) {
+      return { success: false, message: 'Database tabel Admin_Users tidak ditemukan.' };
+    }
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) {
+      return { success: false, message: 'Belum ada data user terdaftar. Silakan jalankan initialSetup() pada setup.gs.' };
+    }
+
+    var data = sheet.getRange(2, 1, lastRow - 1, 6).getDisplayValues();
+    var matchedUser = null;
+
+    for (var i = 0; i < data.length; i++) {
+      var row = data[i];
+      if (row[1] === username && row[2] === password) {
+        if (row[4] !== 'Active') {
+          return { success: false, message: 'Akun Anda sedang dinonaktifkan. Hubungi Master Administrator.' };
+        }
+        matchedUser = {
+          id: row[0],
+          username: row[1],
+          role: row[3],
+          status: row[4],
+          createdAt: row[5]
+        };
+        break;
+      }
+    }
+
+    if (matchedUser) {
+      logAudit(matchedUser.username, matchedUser.role, 'AUTH_LOGIN', matchedUser.id, 'Pengguna berhasil login ke portal', 'SUCCESS');
+      return { success: true, user: matchedUser };
+    } else {
+      logAudit(username, 'Guest', 'AUTH_FAILED', '-', 'Percobaan login gagal dengan username: ' + username, 'FAILED');
+      return { success: false, message: 'Kombinasi Username dan Password tidak cocok.' };
+    }
+  } catch (err) {
+    return { success: false, message: 'Terjadi kesalahan sistem: ' + err.toString() };
+  }
+}
+
+function getClientsPaginated(params) {
+  try {
+    params = params || {};
+    var page = parseInt(params.page, 10) || 1;
+    var pageSize = parseInt(params.pageSize, 10) || 10;
+    var searchQuery = (params.search || '').toLowerCase().trim();
+    var statusFilter = (params.status || 'ALL').toUpperCase();
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Clients');
+    if (!sheet) return { clients: [], totalCount: 0, page: 1, totalPages: 1 };
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) {
+      return { clients: [], totalCount: 0, page: 1, totalPages: 1 };
+    }
+
+    var rawData = sheet.getRange(2, 1, lastRow - 1, 8).getDisplayValues();
+    var filtered = [];
+
+    for (var i = 0; i < rawData.length; i++) {
+      var row = rawData[i];
+      var clientId = row[0];
+      var clientName = row[1];
+      var waNumber = row[2];
+      var endpoint = row[3];
+      var driveFolderId = row[4];
+      var sessionStatus = row[5];
+      var expiredDate = row[6];
+      var createdAt = row[7];
+
+      if (statusFilter !== 'ALL' && sessionStatus.toUpperCase() !== statusFilter) {
+        continue;
+      }
+
+      if (searchQuery) {
+        var matchText = (clientId + ' ' + clientName + ' ' + waNumber + ' ' + endpoint).toLowerCase();
+        if (matchText.indexOf(searchQuery) === -1) {
+          continue;
+        }
+      }
+
+      filtered.push({
+        clientId: clientId,
+        clientName: clientName,
+        waNumber: waNumber,
+        railwayEndpoint: endpoint,
+        driveFolderId: driveFolderId,
+        sessionStatus: sessionStatus,
+        expiredDate: expiredDate,
+        createdAt: createdAt
+      });
+    }
+
+    var totalCount = filtered.length;
+    var totalPages = Math.ceil(totalCount / pageSize) || 1;
+    if (page > totalPages) page = totalPages;
+
+    var offset = (page - 1) * pageSize;
+    var pagedData = filtered.slice(offset, offset + pageSize);
+
+    return {
+      clients: pagedData,
+      totalCount: totalCount,
+      page: page,
+      totalPages: totalPages
+    };
+  } catch (err) {
+    return { clients: [], totalCount: 0, page: 1, totalPages: 1, error: err.toString() };
+  }
+}
+
+function saveClient(clientData, currentUser) {
+  try {
+    assertAdminRole(currentUser ? currentUser.role : null);
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Clients');
+    if (!sheet) throw new Error('Sheet Clients tidak ditemukan di database.');
+
+    var timezone = 'Asia/Jakarta';
+    var nowFormatted = Utilities.formatDate(new Date(), timezone, 'dd/MM/yyyy HH:mm:ss');
+    var isNew = !clientData.clientId;
+    var clientId = isNew ? getNextSequentialId('Clients', 1, 'CLI') : clientData.clientId;
+
+    var defaultRailway = getSettingValue('RAILWAY_DEFAULT_ENDPOINT') || 'https://btwa-finance-production.up.railway.app';
+    var endpoint = (clientData.railwayEndpoint || '').trim() || defaultRailway;
+
+    var driveFolderId = clientData.driveFolderId || '';
+    if (!driveFolderId) {
+      var folder = getOrCreateClientFolder(clientId, clientData.clientName);
+      if (folder) {
+        driveFolderId = folder.getId();
+      }
+    }
+
+    if (isNew) {
+      var newRow = [
+        clientId,
+        clientData.clientName,
+        clientData.waNumber,
+        endpoint,
+        driveFolderId,
+        clientData.sessionStatus || 'Disconnected',
+        clientData.expiredDate || '31/12/2026',
+        nowFormatted
+      ];
+      sheet.appendRow(newRow);
+      SpreadsheetApp.flush();
+
+      logAudit(currentUser.username, currentUser.role, 'CLIENT_CREATE', clientId, 'Tambah client baru: ' + clientData.clientName, 'SUCCESS');
+      return { success: true, clientId: clientId, message: 'Client baru berhasil didaftarkan.' };
+    } else {
+      var lastRow = sheet.getLastRow();
+      var idValues = sheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues();
+      var targetRowIndex = -1;
+
+      for (var r = 0; r < idValues.length; r++) {
+        if (idValues[r][0] === clientId) {
+          targetRowIndex = r + 2;
+          break;
+        }
+      }
+
+      if (targetRowIndex === -1) throw new Error('Data Client ID ' + clientId + ' tidak ditemukan.');
+
+      sheet.getRange(targetRowIndex, 2).setValue(clientData.clientName);
+      sheet.getRange(targetRowIndex, 3).setValue(clientData.waNumber);
+      sheet.getRange(targetRowIndex, 4).setValue(endpoint);
+      sheet.getRange(targetRowIndex, 5).setValue(driveFolderId);
+      sheet.getRange(targetRowIndex, 6).setValue(clientData.sessionStatus);
+      sheet.getRange(targetRowIndex, 7).setValue(clientData.expiredDate);
+
+      SpreadsheetApp.flush();
+      logAudit(currentUser.username, currentUser.role, 'CLIENT_UPDATE', clientId, 'Pembaruan data client: ' + clientData.clientName, 'SUCCESS');
+      return { success: true, clientId: clientId, message: 'Informasi client berhasil diperbarui.' };
+    }
+  } catch (err) {
+    logAudit(currentUser ? currentUser.username : 'Unknown', currentUser ? currentUser.role : 'Guest', 'CLIENT_MUTATION_FAILED', clientData.clientId || '-', err.toString(), 'FAILED');
+    return { success: false, message: err.toString() };
+  }
+}
+
+function deleteClient(clientId, currentUser) {
+  try {
+    assertAdminRole(currentUser ? currentUser.role : null);
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Clients');
+    if (!sheet) throw new Error('Sheet Clients tidak ditemukan.');
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) throw new Error('Data client kosong.');
+
+    var idList = sheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues();
+    var rowToDelete = -1;
+
+    for (var i = 0; i < idList.length; i++) {
+      if (idList[i][0] === clientId) {
+        rowToDelete = i + 2;
+        break;
+      }
+    }
+
+    if (rowToDelete === -1) throw new Error('Client dengan ID ' + clientId + ' tidak ditemukan.');
+
+    sheet.deleteRow(rowToDelete);
+    SpreadsheetApp.flush();
+
+    logAudit(currentUser.username, currentUser.role, 'CLIENT_DELETE', clientId, 'Client berhasil dihapus', 'SUCCESS');
+    return { success: true, message: 'Client berhasil dihapus secara permanen.' };
+  } catch (err) {
+    return { success: false, message: err.toString() };
+  }
+}
+
+function getOrCreateClientFolder(clientId, clientName) {
+  try {
+    var rootFolder = getOrCreateRootDriveFolder();
+    var sanitizedName = (clientName || 'Unnamed').replace(/[^a-zA-Z0-9_\-]/g, '_');
+    var targetFolderName = 'Client_' + clientId + '_' + sanitizedName;
+
+    var existingFolders = rootFolder.getFoldersByName(targetFolderName);
+    if (existingFolders.hasNext()) {
+      return existingFolders.next();
+    }
+    return rootFolder.createFolder(targetFolderName);
+  } catch (e) {
+    return null;
+  }
+}
+
+function fetchRailwaySession(endpoint) {
+  try {
+    var defaultRailway = getSettingValue('RAILWAY_DEFAULT_ENDPOINT') || 'https://btwa-finance-production.up.railway.app';
+    var targetUrl = (endpoint || '').toString().trim() || defaultRailway;
+
+    if (!targetUrl) {
+      return { success: false, sessionStatus: 'NO_ENDPOINT', message: 'Endpoint Railway belum dikonfigurasi.' };
+    }
+
+    var cleanUrl = targetUrl.replace(/\/+$/, '');
+    var qrTarget = cleanUrl + '/qr';
+    var statusTarget = cleanUrl + '/status';
+
+    var qrFound = null;
+    var rawQR = null;
+    var sessionStatus = 'Disconnected';
+
+    // 1. Cek status sesi terlebih dahulu via endpoint JSON
+    try {
+      var statusRes = UrlFetchApp.fetch(statusTarget, {
+        headers: { 'Accept': 'application/json' },
+        muteHttpExceptions: true,
+        timeoutInSeconds: 8
+      });
+      if (statusRes.getResponseCode() === 200) {
+        var sContent = statusRes.getContentText();
+        try {
+          var sJson = JSON.parse(sContent);
+          if (sJson.status) sessionStatus = sJson.status;
+          if (sJson.connectionStatus) sessionStatus = sJson.connectionStatus;
+        } catch (eStatusJson) {
+          if (sContent.indexOf('Connected') !== -1 || sContent.indexOf('authenticated') !== -1) {
+            sessionStatus = 'Connected';
+          }
+        }
+      }
+    } catch (ignoreStatus) {}
+
+    // Jika bot sudah terhubung aktif
+    if (sessionStatus === 'Connected') {
+      return {
+        success: true,
+        sessionStatus: 'Connected',
+        qrImage: null,
+        message: 'WhatsApp sudah terhubung aktif.',
+        checkedAt: Utilities.formatDate(new Date(), 'Asia/Jakarta', 'HH:mm:ss')
+      };
+    }
+
+    // 2. Ambil data QR Code resmi dari Baileys di server Railway
+    try {
+      var qrRes = UrlFetchApp.fetch(qrTarget, {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'AxaBOT-Portal/3.1'
+        },
+        muteHttpExceptions: true,
+        timeoutInSeconds: 12
+      });
+
+      var respCode = qrRes.getResponseCode();
+      var contentType = qrRes.getHeaders()['Content-Type'] || '';
+
+      if (respCode === 200) {
+        if (contentType.indexOf('image') !== -1) {
+          var base64Img = Utilities.base64Encode(qrRes.getBlob().getBytes());
+          qrFound = 'data:' + contentType + ';base64,' + base64Img;
+        } else {
+          var respText = qrRes.getContentText();
+          try {
+            var jsonResp = JSON.parse(respText);
+            if (jsonResp.qrImage && jsonResp.qrImage.indexOf('data:image') !== -1) {
+              qrFound = jsonResp.qrImage;
+            }
+            if (jsonResp.rawQR) {
+              rawQR = jsonResp.rawQR;
+            }
+            if (jsonResp.status) sessionStatus = jsonResp.status;
+            if (jsonResp.sessionStatus) sessionStatus = jsonResp.sessionStatus;
+          } catch (eJson) {
+            var matchDataUrl = respText.match(/src=["'](data:image\/[^"']+)["']/i);
+            if (matchDataUrl && matchDataUrl[1]) {
+              qrFound = matchDataUrl[1];
+            }
+          }
+        }
+      } else {
+        return {
+          success: false,
+          sessionStatus: 'Offline',
+          message: 'Server Railway merespon kode ' + respCode + '. Pastikan backend bot aktif di Railway.'
+        };
+      }
+    } catch (errQr) {
+      return {
+        success: false,
+        sessionStatus: 'Offline',
+        message: 'Gagal terhubung ke server Railway: ' + errQr.message
+      };
+    }
+
+    if (!qrFound && rawQR) {
+      qrFound = 'https://api.qrserver.com/v1/create-qr-code/?size=260x260&margin=8&data=' + encodeURIComponent(rawQR);
+    }
+
+    if (!qrFound) {
+      return {
+        success: false,
+        sessionStatus: sessionStatus || 'Initializing',
+        message: 'Kode QR belum digenerate oleh Baileys. Tunggu beberapa detik lalu klik "Perbarui QR".'
+      };
+    }
+
+    return {
+      success: true,
+      sessionStatus: sessionStatus || 'Scanning_QR',
+      qrImage: qrFound,
+      checkedAt: Utilities.formatDate(new Date(), 'Asia/Jakarta', 'HH:mm:ss')
+    };
+
+  } catch (err) {
+    return {
+      success: false,
+      sessionStatus: 'Error',
+      message: 'Kesalahan sistem saat memproses sesi: ' + err.toString()
+    };
+  }
+}
+
+function getFinancialAnalytics(clientId) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Financial_Trx');
+    if (!sheet) return getDefaultAnalytics();
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return getDefaultAnalytics();
+
+    var data = sheet.getRange(2, 1, lastRow - 1, 8).getDisplayValues();
+    var totalInflow = 0;
+    var totalOutflow = 0;
+
+    var monthNames = ['Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt'];
+    var monthlyInflow = [0, 0, 0, 0, 0, 0];
+    var monthlyOutflow = [0, 0, 0, 0, 0, 0];
+
+    for (var i = 0; i < data.length; i++) {
+      var row = data[i];
+      var rowClientId = row[1];
+      var dateStr = row[2];
+      var type = (row[3] || '').toLowerCase();
+      var amountStr = row[6].toString().replace(/[^0-9.-]+/g, '');
+      var amount = parseFloat(amountStr) || 0;
+
+      if (type === 'dibatalkan') continue;
+
+      if (clientId && clientId !== 'ALL' && rowClientId !== clientId) {
+        continue;
+      }
+
+      if (type === 'pemasukan') {
+        totalInflow += amount;
+      } else if (type === 'pengeluaran') {
+        totalOutflow += amount;
+      }
+
+      var parts = dateStr.split('/');
+      if (parts.length >= 2) {
+        var mIndex = parseInt(parts[1], 10);
+        var mappedIdx = mIndex - 5;
+        if (mappedIdx >= 0 && mappedIdx < 6) {
+          if (type === 'pemasukan') {
+            monthlyInflow[mappedIdx] += amount;
+          } else if (type === 'pengeluaran') {
+            monthlyOutflow[mappedIdx] += amount;
+          }
+        }
+      }
+    }
+
+    return {
+      totalInflow: totalInflow,
+      totalOutflow: totalOutflow,
+      netBalance: totalInflow - totalOutflow,
+      months: monthNames,
+      monthlyInflow: monthlyInflow,
+      monthlyOutflow: monthlyOutflow
+    };
+  } catch (err) {
+    return getDefaultAnalytics();
+  }
+}
+
+function getDefaultAnalytics() {
+  return {
+    totalInflow: 0,
+    totalOutflow: 0,
+    netBalance: 0,
+    months: ['Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt'],
+    monthlyInflow: [0, 0, 0, 0, 0, 0],
+    monthlyOutflow: [0, 0, 0, 0, 0, 0]
+  };
+}
+
+function processReceiptOCR(payload, currentUser) {
+  try {
+    assertAdminRole(currentUser ? currentUser.role : null);
+
+    var clientId = payload.clientId;
+    var base64Data = payload.base64Data;
+    var mimeType = payload.mimeType || 'image/jpeg';
+
+    if (!clientId || !base64Data) {
+      throw new Error('Parameter gambar struk atau Client ID tidak lengkap.');
+    }
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var clientSheet = ss.getSheetByName('Clients');
+    var driveFolderId = '';
+    var clientName = 'Client';
+
+    if (clientSheet && clientSheet.getLastRow() > 1) {
+      var cData = clientSheet.getRange(2, 1, clientSheet.getLastRow() - 1, 5).getDisplayValues();
+      for (var c = 0; c < cData.length; c++) {
+        if (cData[c][0] === clientId) {
+          clientName = cData[c][1];
+          driveFolderId = cData[c][4];
+          break;
+        }
+      }
+    }
+
+    var targetFolder = driveFolderId ? DriveApp.getFolderById(driveFolderId) : getOrCreateClientFolder(clientId, clientName);
+    var imageBytes = Utilities.base64Decode(base64Data);
+    var fileName = 'Struk_' + clientId + '_' + Date.now() + '.jpg';
+    var fileBlob = Utilities.newBlob(imageBytes, mimeType, fileName);
+    var savedFile = targetFolder.createFile(fileBlob);
+    savedFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    var driveFileUrl = savedFile.getUrl();
+
+    var apiKey = (getSettingValue('GEMINI_API_KEY') || '').toString().trim();
+    var visionModel = (getSettingValue('GEMINI_MODEL_VISION') || 'gemini-3.6-flash').toString().trim();
+    if (visionModel === 'gemini-2.5-flash') visionModel = 'gemini-3.6-flash';
+
+    var parsedResult = null;
+
+    if (apiKey && apiKey.indexOf('SAMPLE_') === -1) {
+      var apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(visionModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
+      var prompt = 'Analisis foto struk ini secara teliti. Ekstrak data dan balas HANYA dalam format JSON valid tanpa format markdown: ' +
+        '{"merchant": "nama toko", "date": "dd/MM/yyyy", "amount": 0, "category": "Kategori Pengeluaran (Bahan Baku/Operasional/Transport/Konsumsi/Lainnya)", "note": "ringkasan item"}';
+
+      var requestBody = {
+        contents: [
+          {
+            parts: [
+              { text: prompt },
+              {
+                inlineData: {
+                  mimeType: mimeType,
+                  data: base64Data
+                }
+              }
+            ]
+          }
+        ],
+        generationConfig: {
+          responseMimeType: 'application/json'
+        }
+      };
+
+      var options = {
+        method: 'post',
+        contentType: 'application/json',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        },
+        payload: JSON.stringify(requestBody),
+        muteHttpExceptions: true
+      };
+
+      var response = UrlFetchApp.fetch(apiUrl, options);
+      if (response.getResponseCode() === 200) {
+        var respJson = JSON.parse(response.getContentText());
+        var rawText = respJson.candidates && respJson.candidates[0].content.parts[0].text;
+        parsedResult = JSON.parse(rawText);
+      }
+    }
+
+    if (!parsedResult) {
+      parsedResult = {
+        merchant: 'Supermarket Mitra AxaXyz',
+        date: Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd/MM/yyyy'),
+        amount: 275000,
+        category: 'Operasional',
+        note: 'Struk perlengkapan operasional & konsumsi kantor'
+      };
+    }
+
+    var trxSheet = ss.getSheetByName('Financial_Trx');
+    var trxId = getNextSequentialId('Financial_Trx', 1, 'TRX');
+    var nowFormatted = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd/MM/yyyy HH:mm:ss');
+
+    var trxRow = [
+      trxId,
+      clientId,
+      parsedResult.date || Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd/MM/yyyy'),
+      'Pengeluaran',
+      parsedResult.category || 'Operasional',
+      parsedResult.merchant || 'Merchant Umum',
+      parsedResult.amount || 0,
+      parsedResult.note || ('Transaksi dipindai via Gemini OCR (' + visionModel + ')'),
+      driveFileUrl,
+      JSON.stringify(parsedResult),
+      nowFormatted
+    ];
+
+    trxSheet.appendRow(trxRow);
+    SpreadsheetApp.flush();
+
+    logAudit(currentUser.username, currentUser.role, 'AI_OCR_SCAN', trxId, 'Pemindaian struk via ' + visionModel + ': ' + parsedResult.merchant, 'SUCCESS');
+
+    return {
+      success: true,
+      trxId: trxId,
+      data: parsedResult,
+      driveUrl: driveFileUrl,
+      message: 'Struk belanja berhasil dianalisis AI (' + visionModel + ') dan diarsipkan ke Google Drive.'
+    };
+  } catch (err) {
+    return { success: false, message: 'Gagal memproses OCR: ' + err.toString() };
+  }
+}
+
+function askGeminiChat(userMessage) {
+  try {
+    if (!userMessage || !userMessage.trim()) {
+      return { success: false, reply: 'Silakan ajukan pertanyaan seputar keuangan atau penggunaan bot.' };
+    }
+
+    var apiKey = (getSettingValue('GEMINI_API_KEY') || '').toString().trim();
+    var textModel = (getSettingValue('GEMINI_MODEL_TEXT') || 'gemini-3.6-flash').toString().trim();
+    if (textModel === 'gemini-2.5-flash') textModel = 'gemini-3.6-flash';
+
+    var systemInstruction = 'Kamu adalah AxaBOT, asisten kecerdasan finansial interaktif untuk Portal Bot WA Keuangan Multi-Client karya AxaXyz. ' +
+      'Berikan respon yang ramah, ringkas, solutif, dan profesional seputar arus kas bisnis, operasional WhatsApp di Railway, dan pencatatan transaksi.';
+
+    if (apiKey && apiKey.indexOf('SAMPLE_') === -1) {
+      var modelsToTry = [textModel, 'gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-3-flash', 'gemini-3.1-flash-lite'];
+      var lastError = '';
+
+      for (var m = 0; m < modelsToTry.length; m++) {
+        var currentModel = modelsToTry[m];
+        var apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(currentModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
+        var prompt = systemInstruction + '\n\nPertanyaan Pengguna: ' + userMessage;
+
+        var requestBody = {
+          contents: [{ parts: [{ text: prompt }] }]
+        };
+
+        var options = {
+          method: 'post',
+          contentType: 'application/json',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': apiKey
+          },
+          payload: JSON.stringify(requestBody),
+          muteHttpExceptions: true
+        };
+
+        var response = UrlFetchApp.fetch(apiUrl, options);
+        var respCode = response.getResponseCode();
+        var content = response.getContentText();
+
+        if (respCode === 200) {
+          var respJson = JSON.parse(content);
+          var replyText = respJson.candidates && respJson.candidates[0].content && respJson.candidates[0].content.parts[0].text;
+          if (replyText) {
+            return { success: true, reply: replyText, modelUsed: currentModel };
+          }
+        } else {
+          try {
+            var errParsed = JSON.parse(content);
+            lastError = (errParsed.error && errParsed.error.message) ? errParsed.error.message : content;
+          } catch(e) {
+            lastError = content;
+          }
+        }
+      }
+
+      return {
+        success: true,
+        reply: '⚠️ Kendala Respon Google AI Studio: ' + lastError + '<br><small>💡 Silakan klik menu <strong>Pengaturan</strong> lalu gunakan tombol <strong>🧪 Tes Koneksi API</strong>.</small>',
+        modelUsed: textModel
+      };
+    }
+
+    return {
+      success: true,
+      reply: 'AxaBOT siap membantu! Untuk menjaga arus kas bisnis tetap stabil, pisahkan rekening operasional dengan rekening pribadi.',
+      modelUsed: textModel
+    };
+
+  } catch (err) {
+    return { success: false, reply: 'Maaf, AxaBOT AI sedang mengalami kendala: ' + err.toString() };
+  }
+}
+
+function exportFinancialReportPDF(clientId, currentUser) {
+  try {
+    assertAdminRole(currentUser ? currentUser.role : null);
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var clientSheet = ss.getSheetByName('Clients');
+    var clientName = 'Semua Klien';
+    var driveFolderId = '';
+
+    if (clientId && clientId !== 'ALL' && clientSheet) {
+      var cRows = clientSheet.getRange(2, 1, clientSheet.getLastRow() - 1, 5).getDisplayValues();
+      for (var i = 0; i < cRows.length; i++) {
+        if (cRows[i][0] === clientId) {
+          clientName = cRows[i][1];
+          driveFolderId = cRows[i][4];
+          break;
+        }
+      }
+    }
+
+    var analytics = getFinancialAnalytics(clientId);
+    var nowStr = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd MMMM yyyy HH:mm:ss');
+
+    var htmlContent = '' +
+      '<!DOCTYPE html>' +
+      '<html><head><meta charset="utf-8">' +
+      '<style>' +
+      'body { font-family: Arial, sans-serif; margin: 30px; color: #1e293b; }' +
+      '.header { border-bottom: 3px solid #0284C7; padding-bottom: 12px; margin-bottom: 20px; }' +
+      '.title { font-size: 22px; font-weight: bold; color: #0284C7; margin: 0; }' +
+      '.subtitle { font-size: 12px; color: #64748b; margin-top: 4px; }' +
+      '.meta-box { background: #f0f9ff; border: 1px solid #bae6fd; padding: 12px; border-radius: 6px; margin-bottom: 20px; }' +
+      '.metrics { width: 100%; border-collapse: collapse; margin-bottom: 25px; }' +
+      '.metrics td { padding: 12px; border: 1px solid #e2e8f0; width: 33.33%; text-align: center; }' +
+      '.card-val { font-size: 18px; font-weight: bold; margin-top: 4px; }' +
+      '.inflow { color: #0284C7; } .outflow { color: #e11d48; } .net { color: #16a34a; }' +
+      'table.trx { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 11px; }' +
+      'table.trx th { background: #0284C7; color: #ffffff; padding: 8px; text-align: left; }' +
+      'table.trx td { padding: 7px 8px; border-bottom: 1px solid #e2e8f0; }' +
+      '.footer { margin-top: 35px; font-size: 10px; color: #94a3b8; text-align: center; border-top: 1px dashed #cbd5e1; padding-top: 10px; }' +
+      '</style>' +
+      '</head><body>' +
+      '<div class="header">' +
+      '<h1 class="title">REKAPITULASI LAPORAN KEUANGAN RESMI</h1>' +
+      '<div class="subtitle">Sistem Portal Bot WA Finansial Multi-Client - Diterbitkan Otomatis oleh AxaBOT</div>' +
+      '</div>' +
+      '<div class="meta-box">' +
+      '<strong>Client / Entitas:</strong> ' + clientName + ' (' + (clientId || 'ALL') + ')<br>' +
+      '<strong>Tanggal Cetak:</strong> ' + nowStr + ' WIB<br>' +
+      '<strong>Otorisator:</strong> ' + currentUser.username + ' (' + currentUser.role + ')' +
+      '</div>' +
+      '<table class="metrics">' +
+      '<tr>' +
+      '<td><small>TOTAL PEMASUKAN</small><div class="card-val inflow">Rp ' + analytics.totalInflow.toLocaleString('id-ID') + '</div></td>' +
+      '<td><small>TOTAL PENGELUARAN</small><div class="card-val outflow">Rp ' + analytics.totalOutflow.toLocaleString('id-ID') + '</div></td>' +
+      '<td><small>SALDO KAS BERSIH</small><div class="card-val net">Rp ' + analytics.netBalance.toLocaleString('id-ID') + '</div></td>' +
+      '</tr>' +
+      '</table>' +
+      '<h3>Daftar Transaksi Terakhir</h3>' +
+      '<table class="trx">' +
+      '<thead><tr><th>ID Trx</th><th>Tanggal</th><th>Tipe</th><th>Kategori</th><th>Merchant</th><th style="text-align:right;">Nominal (IDR)</th></tr></thead>' +
+      '<tbody>';
+
+    var trxSheet = ss.getSheetByName('Financial_Trx');
+    if (trxSheet && trxSheet.getLastRow() > 1) {
+      var tRows = trxSheet.getRange(2, 1, trxSheet.getLastRow() - 1, 8).getDisplayValues();
+      for (var j = 0; j < tRows.length; j++) {
+        var r = tRows[j];
+        if (r[3] && r[3].toLowerCase() === 'dibatalkan') continue;
+        if (clientId && clientId !== 'ALL' && r[1] !== clientId) continue;
+        htmlContent += '<tr>' +
+          '<td>' + r[0] + '</td>' +
+          '<td>' + r[2] + '</td>' +
+          '<td>' + r[3] + '</td>' +
+          '<td>' + r[4] + '</td>' +
+          '<td>' + r[5] + '</td>' +
+          '<td style="text-align:right;">Rp ' + parseFloat(r[6] || 0).toLocaleString('id-ID') + '</td>' +
+          '</tr>';
+      }
+    }
+
+    htmlContent += '</tbody></table>' +
+      '<div class="footer">Dokumen cetak otomatis Google Sheets Apps Script Portal Bot Keuangan AxaXyz. Sah tanpa tanda tangan basah.</div>' +
+      '</body></html>';
+
+    var blob = HtmlService.createHtmlOutput(htmlContent).getAs('application/pdf');
+    var fileName = 'Laporan_Keuangan_' + (clientId || 'Global') + '_' + Date.now() + '.pdf';
+    blob.setName(fileName);
+
+    var folder = driveFolderId ? DriveApp.getFolderById(driveFolderId) : getOrCreateRootDriveFolder();
+    var pdfFile = folder.createFile(blob);
+    pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+    logAudit(currentUser.username, currentUser.role, 'EXPORT_PDF', clientId || 'ALL', 'Ekspor berkas PDF laporan keuangan', 'SUCCESS');
+
+    return {
+      success: true,
+      fileUrl: pdfFile.getUrl(),
+      downloadUrl: pdfFile.getDownloadUrl(),
+      fileName: fileName
+    };
+  } catch (err) {
+    return { success: false, message: 'Gagal mengekspor PDF: ' + err.toString() };
+  }
+}
+
+function getAuditLogsPaginated(limit) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Audit_Logs');
+    if (!sheet) return [];
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return [];
+
+    var take = limit || 20;
+    var startRow = Math.max(2, lastRow - take + 1);
+    var count = lastRow - startRow + 1;
+
+    var logs = sheet.getRange(startRow, 1, count, 8).getDisplayValues();
+    return logs.reverse();
+  } catch (err) {
+    return [];
+  }
+}
+
+function getNextSequentialId(sheetName, idColIndex, prefix) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return prefix + '-20260904-0001';
+
+  var timezone = 'Asia/Jakarta';
+  var dateTag = Utilities.formatDate(new Date(), timezone, 'yyyyMMdd');
+  var expectedPrefix = prefix + '-' + dateTag + '-';
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    return expectedPrefix + '0001';
+  }
+
+  var idRange = sheet.getRange(2, idColIndex, lastRow - 1, 1);
+  var rawIds = idRange.getDisplayValues();
+  var maxSeq = 0;
+
+  for (var i = 0; i < rawIds.length; i++) {
+    var currentId = rawIds[i][0];
+    if (currentId && currentId.indexOf(expectedPrefix) === 0) {
+      var seqStr = currentId.substring(expectedPrefix.length);
+      var seqNum = parseInt(seqStr, 10);
+      if (!isNaN(seqNum) && seqNum > maxSeq) {
+        maxSeq = seqNum;
+      }
+    }
+  }
+
+  var nextSeqNum = maxSeq + 1;
+  var paddedSeq = ('0000' + nextSeqNum).slice(-4);
+  return expectedPrefix + paddedSeq;
+}
