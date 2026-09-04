@@ -10,11 +10,11 @@
 const { downloadMediaMessage, delay } = require('@whiskeysockets/baileys');
 const axios = require('axios');
 
-// Konfigurasi Model Google AI Studio (Model utama 3.6 Flash - Anti Deprecated)
+// Konfigurasi Model Google AI Studio (Model utama gemini-3.6-flash)
 const DEFAULT_GEMINI_MODEL = process.env.DEFAULT_GEMINI_MODEL || 'gemini-3.6-flash';
 const FALLBACK_GEMINI_MODEL = process.env.FALLBACK_GEMINI_MODEL || 'gemini-3.1-flash-lite';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GAS_WEBAPP_URL = process.env.GAS_WEBAPP_URL || '';
+let cachedApiKey = (process.env.GEMINI_API_KEY || '').trim();
+const GAS_WEBAPP_URL = (process.env.GAS_WEBAPP_URL || '').trim();
 
 // Urutan Cascade Model AI Studio: Otomatis failover jika 429 atau timeout
 const GEMINI_MODELS_CASCADE = [
@@ -49,6 +49,42 @@ const WALLET_MAP = {
   'SHOPEEPAY': 'ShopeePay',
   'LINKAJA': 'LinkAja'
 };
+
+/**
+ * Mengambil Kunci API Gemini Aktif (Environment Railway atau fallback ke Google Sheet GAS)
+ */
+async function getEffectiveApiKey() {
+  if (cachedApiKey && cachedApiKey.length > 10) {
+    return cachedApiKey;
+  }
+
+  // Fallback: Ambil API Key yang tersimpan di sheet Settings via endpoint GAS
+  if (GAS_WEBAPP_URL) {
+    try {
+      const res = await axios.post(GAS_WEBAPP_URL, {
+        action: 'getAllSettings',
+        currentUser: { role: 'Admin', username: 'Bot_Sync' }
+      }, {
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        timeout: 8000
+      });
+
+      if (res.data && res.data.settings) {
+        for (const s of res.data.settings) {
+          if (s.key === 'GEMINI_API_KEY' && s.value && !s.value.includes('SAMPLE_')) {
+            cachedApiKey = s.value.trim();
+            console.log('[AxaBOT] API Key Gemini berhasil disinkronkan dari Google Sheets.');
+            return cachedApiKey;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[AxaBOT] Gagal mengambil fallback API Key dari GAS:', e.message);
+    }
+  }
+
+  return cachedApiKey;
+}
 
 /**
  * Penanganan Pesan Masuk WhatsApp (Abaikan Grup Secara Mutlak)
@@ -101,24 +137,49 @@ async function handleIncomingMessages(sock, chatUpdate) {
 
     const lowerText = textContent.toLowerCase();
 
+    // Command: Bantuan / Menu
     if (lowerText === '!help' || lowerText === '!menu') {
       await simulateTyping(sock, remoteJid);
       await sendHelpMenu(sock, remoteJid);
       continue;
     }
 
+    // Command: Diagnostic Test Gemini API
+    if (lowerText === '!test' || lowerText === '!ping') {
+      await simulateTyping(sock, remoteJid);
+      await handleTestGeminiApi(sock, remoteJid);
+      continue;
+    }
+
+    // Command: Tanya Gemini AI Lengkap (!tanya <pertanyaan> atau !ask <pertanyaan>)
+    if (lowerText.startsWith('!tanya ') || lowerText.startsWith('!ask ')) {
+      const userPrompt = textContent.replace(/^!(tanya|ask)\s+/i, '').trim();
+      if (!userPrompt) {
+        await sock.sendMessage(remoteJid, {
+          text: '💡 *Format Perintah Tanya AI:*\nKetik *!tanya [pertanyaan Anda]*\n\n_Contoh:_ `!tanya Bagaimana cara membuat pencatatan arus kas harian toko agar rapi?`'
+        });
+        continue;
+      }
+      await simulateTyping(sock, remoteJid);
+      await handleAiComprehensiveQuestion(sock, remoteJid, userPrompt);
+      continue;
+    }
+
+    // Command: Cek Saldo Multi-Dompet
     if (lowerText === '!saldo') {
       await simulateTyping(sock, remoteJid);
       await handleCheckBalance(sock, remoteJid);
       continue;
     }
 
+    // Command: Unduh Laporan PDF
     if (lowerText === '!rekap') {
       await simulateTyping(sock, remoteJid);
       await handleReportLink(sock, remoteJid);
       continue;
     }
 
+    // Command: Batalkan Transaksi Terakhir (Quick Undo)
     if (lowerText === '!batal' || lowerText === '!undo') {
       await simulateTyping(sock, remoteJid);
       await handleQuickUndo(sock, remoteJid);
@@ -133,7 +194,7 @@ async function handleIncomingMessages(sock, chatUpdate) {
       continue;
     }
 
-    // Jika pesan merupakan pertanyaan seputar keuangan / tips bisnis, arahkan ke Asisten AI
+    // Jika pesan merupakan pertanyaan umum seputar keuangan, arahkan ke Asisten AI
     if (isFinancialQuestion(textContent)) {
       await simulateTyping(sock, remoteJid);
       await handleAiFinancialAdvice(sock, remoteJid, textContent);
@@ -150,6 +211,154 @@ async function simulateTyping(sock, jid) {
     await sock.sendPresenceUpdate('paused', jid);
   } catch (presenceErr) {
     // Non-fatal
+  }
+}
+
+/**
+ * Uji Diagnostik Koneksi Google AI Studio (!test)
+ */
+async function handleTestGeminiApi(sock, remoteJid) {
+  const startTime = Date.now();
+  const apiKey = await getEffectiveApiKey();
+
+  if (!apiKey) {
+    return sock.sendMessage(remoteJid, {
+      text:
+        '❌ *Koneksi Gemini AI Gagal!*\n\n' +
+        '• *Status:* `API Key Tidak Ditemukan`\n' +
+        '• *Solusi:* Tambahkan variabel `GEMINI_API_KEY` di dashboard Railway atau masukkan di tab Settings Google Sheet.'
+    });
+  }
+
+  const maskedKey = apiKey.length > 8 ? `${apiKey.substring(0, 6)}...${apiKey.substring(apiKey.length - 4)}` : 'Terdaftar';
+
+  try {
+    // URL REST API bersih tanpa tag Markdown
+    const testEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(DEFAULT_GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+    const response = await axios.post(
+      testEndpoint,
+      {
+        contents: [
+          {
+            parts: [
+              { text: 'Ping test. Jawab tepat 3 kata: SISTEM AXA AKTIF' }
+            ]
+          }
+        ]
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        },
+        timeout: 15000
+      }
+    );
+
+    const latencyMs = Date.now() - startTime;
+    const botReply = response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 'OK';
+
+    const testSummary =
+      `🧪 *Hasil Uji Koneksi Google AI Studio*\n\n` +
+      `• *Status:* *TERHUBUNG & ONLINE* ✅\n` +
+      `• *Model AI Utama:* \`${DEFAULT_GEMINI_MODEL}\`\n` +
+      `• *Respon Model:* "${botReply}"\n` +
+      `• *Latensi API:* \`${latencyMs} ms\`\n` +
+      `• *Kunci API:* \`${maskedKey}\`\n` +
+      `• *Fitur OCR & Tanya AI:* *SIAP DIGUNAKAN* 🚀`;
+
+    await sock.sendMessage(remoteJid, { text: testSummary });
+  } catch (err) {
+    const latencyMs = Date.now() - startTime;
+    const errorDetails = err.response?.data?.error?.message || err.message;
+    const httpStatus = err.response?.status || 'N/A';
+
+    console.error('[AxaBOT Test API Error]', errorDetails);
+
+    const failSummary =
+      `❌ *Uji Koneksi Gemini API Gagal!*\n\n` +
+      `• *Model Target:* \`${DEFAULT_GEMINI_MODEL}\`\n` +
+      `• *HTTP Status:* \`${httpStatus}\`\n` +
+      `• *Pesan Error:* \`${errorDetails}\`\n` +
+      `• *Kunci API Terdeteksi:* \`${maskedKey}\`\n` +
+      `• *Waktu Pengujian:* \`${latencyMs} ms\`\n\n` +
+      `💡 _Pastikan kuota API Key aktif di Google AI Studio dan format model didukung._`;
+
+    await sock.sendMessage(remoteJid, { text: failSummary });
+  }
+}
+
+/**
+ * Konsultasi Finansial & Tanya Jawab Komprehensif (!tanya <pertanyaan>)
+ */
+async function handleAiComprehensiveQuestion(sock, remoteJid, userQuestion) {
+  const apiKey = await getEffectiveApiKey();
+
+  if (!apiKey) {
+    return sock.sendMessage(remoteJid, {
+      text: '⚠️ *Kunci API Gemini belum dikonfigurasi di server.* Hubungi Administrator.'
+    });
+  }
+
+  try {
+    await sock.sendMessage(remoteJid, { text: '🧠 *AxaBOT sedang merumuskan analisa keuangan untuk Anda...*' });
+
+    const prompt =
+      'Kamu adalah AxaBOT, konsultan keuangan bisnis, kasir, dan akuntansi cerdas untuk UMKM Axa Xyz. ' +
+      'Berikan penjelasan yang mendalam, terstruktur, berbasis angka/langkah konkret, ramah, dan mudah dipahami oleh pemilik usaha atas pertanyaan berikut:\n\n' +
+      userQuestion;
+
+    let responseText = null;
+    let modelUsed = DEFAULT_GEMINI_MODEL;
+    let lastError = null;
+
+    for (const model of GEMINI_MODELS_CASCADE) {
+      try {
+        // Endpoint REST API murni tanpa formatting Markdown
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+        const response = await axios.post(
+          endpoint,
+          {
+            contents: [{ parts: [{ text: prompt }] }]
+          },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': apiKey
+            },
+            timeout: 25000
+          }
+        );
+
+        if (response.status === 200 && response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+          responseText = response.data.candidates[0].content.parts[0].text;
+          modelUsed = model;
+          break;
+        }
+      } catch (err) {
+        lastError = err;
+        console.warn(`[AxaBOT Tanya AI] Model ${model} gagal: ${err.message}. Mencoba model berikutnya...`);
+      }
+    }
+
+    if (!responseText) {
+      throw new Error(lastError?.response?.data?.error?.message || lastError?.message || 'Gagal memproses jawaban AI');
+    }
+
+    const finalAnswer =
+      `🤖 *Jawaban AxaBOT Financial AI:*\n\n` +
+      `${responseText.trim()}\n\n` +
+      `────────────────────────\n` +
+      `💡 _Model Engine: \`${modelUsed}\`_`;
+
+    await sock.sendMessage(remoteJid, { text: finalAnswer });
+  } catch (err) {
+    console.error('[AxaBOT Tanya AI Error]', err.message);
+    await sock.sendMessage(remoteJid, {
+      text: `❌ *Gagal menjawab pertanyaan:* ${err.message}\nSilakan coba beberapa saat lagi atau gunakan perintah *!test* untuk cek status server.`
+    });
   }
 }
 
@@ -348,19 +557,21 @@ async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
   } catch (ocrErr) {
     console.error('[AxaBOT OCR Error]', ocrErr.message);
     await sock.sendMessage(remoteJid, {
-      text: `❌ *Gagal memindai nota:* ${ocrErr.message}\nSilakan input manual dengan format: _Beli barang 50k #tunai_`
+      text: `❌ *Gagal memindai nota:* ${ocrErr.message}\nSilakan ketik *!test* untuk cek koneksi AI, atau input manual: _Beli barang 50k #tunai_`
     });
   }
 }
 
 async function callGeminiOCRWithFallback(base64Image, mimeType) {
-  if (!GEMINI_API_KEY) {
+  const apiKey = await getEffectiveApiKey();
+
+  if (!apiKey) {
     throw new Error('GEMINI_API_KEY belum dikonfigurasi pada environment Railway.');
   }
 
   const prompt =
     'Analisis foto bukti struk belanja ini secara presisi dan objektif. ' +
-    'Balas HANYA dalam format JSON valid tanpa tanda pembungkus markdown ```json: ' +
+    'Balas HANYA dalam format JSON valid tanpa tanda pembungkus markdown: ' +
     '{"merchant": "nama toko", "date": "dd/MM/yyyy", "amount": 0, "category": "Kategori Pengeluaran (Bahan Baku/Operasional/Transport/Konsumsi/Lainnya)", "note": "ringkasan item singkat"}';
 
   let lastError = null;
@@ -368,7 +579,9 @@ async function callGeminiOCRWithFallback(base64Image, mimeType) {
   for (const model of GEMINI_MODELS_CASCADE) {
     try {
       console.log(`[AxaBOT] Mengirim request Gemini OCR menggunakan model: ${model}`);
-      const endpoint = `[https://generativelanguage.googleapis.com/v1beta/models/$](https://generativelanguage.googleapis.com/v1beta/models/$){encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+      // URL murni tanpa karakter markdown link yang memicu "Invalid URL"
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
       const requestBody = {
         contents: [
@@ -392,7 +605,7 @@ async function callGeminiOCRWithFallback(base64Image, mimeType) {
       const response = await axios.post(endpoint, requestBody, {
         headers: {
           'Content-Type': 'application/json',
-          'x-goog-api-key': GEMINI_API_KEY
+          'x-goog-api-key': apiKey
         },
         timeout: 28000
       });
@@ -410,11 +623,12 @@ async function callGeminiOCRWithFallback(base64Image, mimeType) {
     }
   }
 
-  throw new Error(`Semua model Gemini gagal merespon: ${lastError?.message || 'Network Timeout'}`);
+  throw new Error(`Semua model Gemini gagal merespon: ${lastError?.response?.data?.error?.message || lastError?.message || 'Network Timeout'}`);
 }
 
 async function handleAiFinancialAdvice(sock, remoteJid, userQuestion) {
-  if (!GEMINI_API_KEY) return;
+  const apiKey = await getEffectiveApiKey();
+  if (!apiKey) return;
 
   try {
     const prompt =
@@ -422,14 +636,15 @@ async function handleAiFinancialAdvice(sock, remoteJid, userQuestion) {
       'Berikan jawaban singkat, praktis, ramah, dan solutif (maksimal 3 paragraf) untuk pertanyaan pemilik toko berikut:\n\n' +
       userQuestion;
 
-    const endpoint = `[https://generativelanguage.googleapis.com/v1beta/models/$](https://generativelanguage.googleapis.com/v1beta/models/$){encodeURIComponent(DEFAULT_GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    // URL murni yang valid
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(DEFAULT_GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
     const response = await axios.post(endpoint, {
       contents: [{ parts: [{ text: prompt }] }]
     }, {
       headers: {
         'Content-Type': 'application/json',
-        'x-goog-api-key': GEMINI_API_KEY
+        'x-goog-api-key': apiKey
       },
       timeout: 15000
     });
@@ -447,7 +662,7 @@ async function handleAiFinancialAdvice(sock, remoteJid, userQuestion) {
 
 function isFinancialQuestion(text) {
   const lower = text.toLowerCase();
-  const qWords = ['tips', 'tanya', 'bagaimana cara', 'berapa rasio', 'saran keuangan', 'strategi kas', 'kelola omset'];
+  const qWords = ['tips', 'bagaimana cara', 'berapa rasio', 'saran keuangan', 'strategi kas', 'kelola omset'];
   return qWords.some((w) => lower.includes(w)) || (lower.endsWith('?') && lower.length > 15);
 }
 
@@ -561,11 +776,13 @@ async function sendHelpMenu(sock, remoteJid) {
     `• _Terima transfer 150000 #gopay_\n\n` +
     `*3. Foto Struk Belanja:*\n` +
     `• Kirim foto struk/nota dengan caption tag dompet (misal: _#bca_). AI Gemini 3.6 Flash akan membaca total dan nama toko otomatis!\n\n` +
-    `*4. Perintah Cepat:*\n` +
-    `• *!saldo* : Cek ringkasan kas & dompet\n` +
-    `• *!rekap* : Unduh berkas laporan PDF resmi\n` +
-    `• *!batal* : Batalkan transaksi terakhir (< 5 menit)\n` +
-    `• *!menu*  : Tampilkan menu panduan ini`;
+    `*4. Perintah Cepat & AI:*\n` +
+    `• *!test*   : Tes diagnostik koneksi Gemini AI & latensi\n` +
+    `• *!tanya*  : Konsultasi finansial mendalam (*!tanya <soal>*)\n` +
+    `• *!saldo*  : Cek ringkasan kas & rincian dompet\n` +
+    `• *!rekap*  : Unduh berkas laporan PDF resmi\n` +
+    `• *!batal*  : Batalkan transaksi terakhir (< 5 menit)\n` +
+    `• *!menu*   : Tampilkan menu panduan ini`;
 
   await sock.sendMessage(remoteJid, { text: guide });
 }
