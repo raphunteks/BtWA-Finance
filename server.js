@@ -2,7 +2,7 @@
  * ====================================================================
  * AXA XYZ WHATSAPP FINANCIAL BOT MICROSERVICE ENGINE
  * Author      : Axa Xyz Engineering
- * Environment : Railway / Node.js 18+ / CommonJS
+ * Environment : Railway / Node.js 18+ / CommonJSs
  * File        : server.js
  * ====================================================================
  * 
