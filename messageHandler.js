@@ -27,7 +27,6 @@ const GEMINI_MODELS_CASCADE = [
 ];
 
 // In-Memory cache untuk Fitur Quick Undo Transaksi (Masa aktif: 5 menit)
-// Key: remoteJid, Value: { trxId, amount, type, category, wallet, description, timestamp }
 const undoCache = new Map();
 const UNDO_EXPIRATION_MS = 5 * 60 * 1000;
 
@@ -51,9 +50,6 @@ const WALLET_MAP = {
   'LINKAJA': 'LinkAja'
 };
 
-/**
- * Router Penanganan Pesan Masuk WhatsApp
- */
 async function handleIncomingMessages(sock, chatUpdate) {
   if (chatUpdate.type !== 'notify') return;
 
@@ -89,7 +85,6 @@ async function handleIncomingMessages(sock, chatUpdate) {
 
     if (!textContent) continue;
 
-    // Evaluasi Perintah Khusus (Commands)
     const lowerText = textContent.toLowerCase();
 
     if (lowerText === '!help' || lowerText === '!menu') {
@@ -133,9 +128,6 @@ async function handleIncomingMessages(sock, chatUpdate) {
   }
 }
 
-/**
- * Simulasi Status Sedang Mengetik (Anti-Ban & Anti-Spam)
- */
 async function simulateTyping(sock, jid) {
   try {
     await sock.sendPresenceUpdate('composing', jid);
@@ -147,9 +139,6 @@ async function simulateTyping(sock, jid) {
   }
 }
 
-/**
- * Smart Financial Parser: Deteksi Otomatis Jenis, Nominal, Dompet & Kategori
- */
 function parseFinancialText(text) {
   if (!text || text.startsWith('!')) return null;
 
@@ -234,9 +223,6 @@ function parseFinancialText(text) {
   };
 }
 
-/**
- * Menyimpan Catatan Transaksi Teks ke Backend & Mengisi Cache Undo
- */
 async function handleSaveFinancialText(sock, remoteJid, parsedTrx, pushName) {
   const trxId = `TRX-${getFormattedDateId()}-${Math.floor(1000 + Math.random() * 9000)}`;
   const nowStr = formatFullDate(new Date());
@@ -284,9 +270,6 @@ async function handleSaveFinancialText(sock, remoteJid, parsedTrx, pushName) {
   await sock.sendMessage(remoteJid, { text: replyMessage });
 }
 
-/**
- * Penanganan Media Gambar Struk Belanja Menggunakan Gemini AI OCR
- */
 async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
   try {
     await sock.sendMessage(remoteJid, { text: '⏳ *Sedang memindai nota belanja dengan Gemini 3.6 Flash...*' });
@@ -295,7 +278,6 @@ async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
     const base64Data = buffer.toString('base64');
     const mimeType = msg.message.imageMessage.mimetype || 'image/jpeg';
 
-    // Ekstraksi tag dompet dari caption foto struk jika ada
     let wallet = 'Tunai';
     const tagMatch = caption.match(/#([a-zA-Z0-9_]+)/);
     if (tagMatch) {
@@ -303,7 +285,6 @@ async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
       wallet = WALLET_MAP[rawTag] || rawTag;
     }
 
-    // Panggil OCR dengan mekanisme cascade multi-model
     const ocrResult = await callGeminiOCRWithFallback(base64Data, mimeType);
 
     const trxId = `TRX-${getFormattedDateId()}-${Math.floor(1000 + Math.random() * 9000)}`;
@@ -364,9 +345,6 @@ async function handleImageReceipt(sock, remoteJid, msg, caption, pushName) {
   }
 }
 
-/**
- * Pemanggilan REST API Google AI Studio dengan Fallback Cascade Otomatis
- */
 async function callGeminiOCRWithFallback(base64Image, mimeType) {
   if (!GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY belum dikonfigurasi pada environment Railway.');
@@ -427,9 +405,6 @@ async function callGeminiOCRWithFallback(base64Image, mimeType) {
   throw new Error(`Semua model Gemini gagal merespon: ${lastError?.message || 'Network Timeout'}`);
 }
 
-/**
- * Asisten Konsultasi Finansial Interaktif via Gemini 3.6 Flash
- */
 async function handleAiFinancialAdvice(sock, remoteJid, userQuestion) {
   if (!GEMINI_API_KEY) return;
 
@@ -468,9 +443,6 @@ function isFinancialQuestion(text) {
   return qWords.some((w) => lower.includes(w)) || (lower.endsWith('?') && lower.length > 15);
 }
 
-/**
- * Fitur Pembatalan Kilat (Quick Undo) dalam Jendela 5 Menit
- */
 async function handleQuickUndo(sock, remoteJid) {
   const cached = undoCache.get(remoteJid);
 
@@ -488,10 +460,8 @@ async function handleQuickUndo(sock, remoteJid) {
     });
   }
 
-  // Hapus dari cache segera
   undoCache.delete(remoteJid);
 
-  // Kirim sinyal pembatalan ke Google Apps Script
   syncToGAS({
     action: 'cancelTransaction',
     trxId: cached.trxId
@@ -509,9 +479,6 @@ async function handleQuickUndo(sock, remoteJid) {
   await sock.sendMessage(remoteJid, { text: replyText });
 }
 
-/**
- * Pengecekan Saldo Kas dengan Rincian Multi-Dompet
- */
 async function handleCheckBalance(sock, remoteJid) {
   try {
     if (!GAS_WEBAPP_URL) {
@@ -553,9 +520,6 @@ async function handleCheckBalance(sock, remoteJid) {
   }
 }
 
-/**
- * Pengambilan Tautan Berkas Laporan PDF Resmi
- */
 async function handleReportLink(sock, remoteJid) {
   try {
     if (!GAS_WEBAPP_URL) {
@@ -575,9 +539,6 @@ async function handleReportLink(sock, remoteJid) {
   }
 }
 
-/**
- * Menu Bantuan dan Panduan Format Chat
- */
 async function sendHelpMenu(sock, remoteJid) {
   const guide =
     `🤖 *Panduan Bot Keuangan Axa Xyz*\n\n` +
@@ -601,9 +562,6 @@ async function sendHelpMenu(sock, remoteJid) {
   await sock.sendMessage(remoteJid, { text: guide });
 }
 
-/**
- * Helper Sinkronisasi HTTP ke Google Apps Script
- */
 async function syncToGAS(payload) {
   if (!GAS_WEBAPP_URL) return;
   try {
