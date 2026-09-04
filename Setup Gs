@@ -1,0 +1,202 @@
+/**
+ * ====================================================================
+ * PORTAL BOT WA KEUANGAN MULTI-CLIENT - SETUP & SAFE MIGRATION SCRIPT
+ * Author : AxaBOT by AxaXyz
+ * File   : setup.gs
+ * ====================================================================
+ */
+
+var DB_SCHEMAS = {
+  Admin_Users: [
+    'ID_Admin',
+    'Username',
+    'Password',
+    'Role',
+    'Status',
+    'Created_At'
+  ],
+  Settings: [
+    'Setting_Key',
+    'Setting_Value',
+    'Description',
+    'Updated_At'
+  ],
+  Clients: [
+    'Client_ID',
+    'Client_Name',
+    'WA_Number',
+    'Railway_Endpoint',
+    'Drive_Folder_ID',
+    'Session_Status',
+    'Expired_Date',
+    'Created_At'
+  ],
+  Financial_Trx: [
+    'Trx_ID',
+    'Client_ID',
+    'Date',
+    'Type',
+    'Category',
+    'Merchant',
+    'Amount',
+    'Note',
+    'Drive_File_URL',
+    'OCR_Raw_Data',
+    'Created_At'
+  ],
+  Audit_Logs: [
+    'Log_ID',
+    'Timestamp',
+    'User',
+    'Role',
+    'Action_Type',
+    'Target_ID',
+    'Details',
+    'Status'
+  ]
+};
+
+function initialSetup() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var timezone = 'Asia/Jakarta';
+    var nowFormatted = Utilities.formatDate(new Date(), timezone, 'dd/MM/yyyy HH:mm:ss');
+    
+    // 1. Periksa & Inisialisasi Sheet berdasarkan skema
+    for (var sheetName in DB_SCHEMAS) {
+      if (DB_SCHEMAS.hasOwnProperty(sheetName)) {
+        var sheet = ss.getSheetByName(sheetName);
+        var expectedHeaders = DB_SCHEMAS[sheetName];
+
+        if (!sheet) {
+          sheet = ss.insertSheet(sheetName);
+        }
+
+        var lastRow = sheet.getLastRow();
+        var lastCol = sheet.getLastColumn();
+
+        if (lastRow === 0) {
+          sheet.getRange(1, 1, 1, expectedHeaders.length).setValues([expectedHeaders]);
+          formatHeaderRow(sheet, expectedHeaders.length);
+        } else {
+          var currentHeadersRange = sheet.getRange(1, 1, 1, Math.max(lastCol, expectedHeaders.length));
+          var currentHeaders = currentHeadersRange.getDisplayValues()[0];
+          for (var i = 0; i < expectedHeaders.length; i++) {
+            if (currentHeaders[i] !== expectedHeaders[i]) {
+              sheet.getRange(1, i + 1).setValue(expectedHeaders[i]);
+            }
+          }
+          formatHeaderRow(sheet, expectedHeaders.length);
+        }
+      }
+    }
+
+    // 2. Inisialisasi Data Default (Admin & Settings Saja, Sheet Clients Dibiarkan Kosong)
+    seedInitialData(ss, nowFormatted);
+
+    // 3. Safe Migration: Pastikan model AI dan Default Railway Endpoint terdaftar
+    ensureSettingsConfig(ss, nowFormatted);
+
+    // 4. Buat / Pastikan Folder Induk Google Drive tersedia
+    getOrCreateRootDriveFolder();
+
+    SpreadsheetApp.flush();
+    Logger.log('Inisialisasi database AxaXyz berhasil (Sheet Clients bersih tanpa data dummy).');
+    return { success: true, message: 'Setup database AxaXyz berhasil diselesaikan. Kolom Clients bersih dan siap digunakan.' };
+
+  } catch (error) {
+    Logger.log('Error saat initialSetup: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+function formatHeaderRow(sheet, colCount) {
+  var headerRange = sheet.getRange(1, 1, 1, colCount);
+  headerRange.setFontWeight('bold')
+             .setBackground('#0284C7')
+             .setFontColor('#FFFFFF')
+             .setHorizontalAlignment('center')
+             .setVerticalAlignment('middle');
+  sheet.setFrozenRows(1);
+}
+
+function seedInitialData(ss, nowStr) {
+  // A. Admin Users Seed
+  var userSheet = ss.getSheetByName('Admin_Users');
+  if (userSheet && userSheet.getLastRow() <= 1) {
+    var users = [
+      ['USR-20260904-0001', 'admin', 'admin123', 'Admin', 'Active', nowStr],
+      ['USR-20260904-0002', 'viewer', 'viewer123', 'Viewer', 'Active', nowStr]
+    ];
+    userSheet.getRange(2, 1, users.length, users[0].length).setValues(users);
+  }
+
+  // B. Settings Seed (Default Railway Endpoint Aktif & Gemini 3.6 Flash)
+  var settingSheet = ss.getSheetByName('Settings');
+  if (settingSheet && settingSheet.getLastRow() <= 1) {
+    var defaultSettings = [
+      ['GEMINI_API_KEY', 'SAMPLE_GEMINI_KEY_AXAXYZ', 'Kunci API Google AI Studio untuk OCR Struk & Chatbot AI', nowStr],
+      ['GEMINI_MODEL_TEXT', 'gemini-3.6-flash', 'Model AI Google AI Studio untuk Chatbox Asisten', nowStr],
+      ['GEMINI_MODEL_VISION', 'gemini-3.6-flash', 'Model AI Google AI Studio untuk OCR Struk Belanja', nowStr],
+      ['RAILWAY_DEFAULT_ENDPOINT', 'https://btwa-finance-production.up.railway.app', 'Endpoint Utama Server Railway Bot WhatsApp AxaXyz', nowStr],
+      ['API_SECRET_TOKEN', 'AXA_XYZ_SECRET_2026', 'Token Otentikasi Sinkronisasi Internal Railway', nowStr],
+      ['APP_NAME', 'Portal Bot WA Keuangan AxaXyz', 'Nama Brand Aplikasi Web Portal', nowStr],
+      ['DEFAULT_CURRENCY', 'IDR', 'Mata Uang Standar Transaksi', nowStr]
+    ];
+    settingSheet.getRange(2, 1, defaultSettings.length, defaultSettings[0].length).setValues(defaultSettings);
+  }
+
+  // C. Clients Sheet: DIBIARKAN BERSIH KOSONG (Hanya Header, tanpa dummy data)
+
+  // D. Audit Logs Seed
+  var auditSheet = ss.getSheetByName('Audit_Logs');
+  if (auditSheet && auditSheet.getLastRow() <= 1) {
+    var logs = [
+      ['LOG-20260904-0001', nowStr, 'SYSTEM', 'Admin', 'DATABASE_INIT', 'ALL', 'Inisialisasi sistem database otomatis oleh AxaBOT', 'SUCCESS']
+    ];
+    auditSheet.getRange(2, 1, logs.length, logs[0].length).setValues(logs);
+  }
+}
+
+function ensureSettingsConfig(ss, nowFormatted) {
+  var settingSheet = ss.getSheetByName('Settings');
+  if (!settingSheet || settingSheet.getLastRow() <= 1) return;
+
+  var lastRow = settingSheet.getLastRow();
+  var rows = settingSheet.getRange(2, 1, lastRow - 1, 2).getDisplayValues();
+  var existingKeys = [];
+
+  for (var i = 0; i < rows.length; i++) {
+    var keyName = rows[i][0].toString().trim().toUpperCase();
+    var curVal = rows[i][1].toString().trim();
+    existingKeys.push(keyName);
+
+    // Otomatis perbarui model deprecated gemini-2.5-flash ke gemini-3.6-flash
+    if ((keyName === 'GEMINI_MODEL_TEXT' || keyName === 'GEMINI_MODEL_VISION') && curVal === 'gemini-2.5-flash') {
+      settingSheet.getRange(i + 2, 2).setValue('gemini-3.6-flash');
+      settingSheet.getRange(i + 2, 4).setValue(nowFormatted);
+    }
+  }
+
+  if (existingKeys.indexOf('GEMINI_MODEL_TEXT') === -1) {
+    settingSheet.appendRow(['GEMINI_MODEL_TEXT', 'gemini-3.6-flash', 'Model AI Google AI Studio untuk Chatbox Asisten', nowFormatted]);
+  }
+  if (existingKeys.indexOf('GEMINI_MODEL_VISION') === -1) {
+    settingSheet.appendRow(['GEMINI_MODEL_VISION', 'gemini-3.6-flash', 'Model AI Google AI Studio untuk OCR Struk Belanja', nowFormatted]);
+  }
+  if (existingKeys.indexOf('RAILWAY_DEFAULT_ENDPOINT') === -1) {
+    settingSheet.appendRow(['RAILWAY_DEFAULT_ENDPOINT', 'https://btwa-finance-production.up.railway.app', 'Endpoint Utama Server Railway Bot WhatsApp AxaXyz', nowFormatted]);
+  }
+  if (existingKeys.indexOf('API_SECRET_TOKEN') === -1) {
+    settingSheet.appendRow(['API_SECRET_TOKEN', 'AXA_XYZ_SECRET_2026', 'Token Otentikasi Sinkronisasi Internal Railway', nowFormatted]);
+  }
+}
+
+function getOrCreateRootDriveFolder() {
+  var rootName = 'Portal_Bot_Keuangan_AxaXyz';
+  var folders = DriveApp.getFoldersByName(rootName);
+  if (folders.hasNext()) {
+    return folders.next();
+  }
+  return DriveApp.createFolder(rootName);
+}
