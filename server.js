@@ -7,6 +7,7 @@
  * ====================================================================
  * 
  * FITUR UTAMA:
+ * - Native Global Crypto Polyfill: Mengatasi error "crypto is not defined" di Baileys
  * - Dual Realtime Transport: Socket.IO (/socket.io) & Plaintext WebSocket (/ws)
  * - Anti-Loop Spam Reconnect: Membersihkan session korup otomatis saat status undefined
  * - Live QR Code Broadcasting: Push QR Base64 Data URL realtime ke web Vercel
@@ -14,6 +15,28 @@
  * - Express REST API & Health Check Monitor
  * - Daily Push Reminder Cron Scheduler (20:00 WIB)
  */
+
+// 1. INJEKSI GLOBAL CRYPTO POLYFILL (WAJIB DI PALING ATAS SEBELUM IMPORT BAILEYS)
+const nodeCrypto = require('crypto');
+
+try {
+  if (!global.crypto) {
+    global.crypto = nodeCrypto.webcrypto || nodeCrypto;
+  }
+  // Pastikan WebCrypto subtle dan Node randomBytes tersedia di global scope
+  if (nodeCrypto.webcrypto && !global.crypto.subtle) {
+    global.crypto.subtle = nodeCrypto.webcrypto.subtle;
+  }
+  if (!global.crypto.randomBytes) {
+    global.crypto.randomBytes = nodeCrypto.randomBytes.bind(nodeCrypto);
+  }
+} catch (cryptoErr) {
+  global.crypto = nodeCrypto;
+}
+
+if (!globalThis.crypto) {
+  globalThis.crypto = global.crypto;
+}
 
 const express = require('express');
 const cors = require('cors');
@@ -240,7 +263,7 @@ wss.on('connection', (wsClient, req) => {
  * Resolusi versi WhatsApp Web dinamis agar terhindar dari penolakan handshake 405
  */
 async function resolveWaVersion() {
-  let resolvedVersion = [2, 3000, 1042466098]; // Fallback aman
+  let resolvedVersion = [2, 3000, 1046792031]; // Fallback versi mutakhir
   try {
     if (typeof fetchLatestWaWebVersion === 'function') {
       const waWeb = await fetchLatestWaWebVersion();
@@ -378,7 +401,6 @@ async function startWASocket() {
         }
 
         // 2. Kasus Sesi Belum Registered tapi Berulang Kali Putus dengan Status Undefined
-        // (Inilah penyebab log spam #61, #62. Sesi korup wajib dibersihkan agar keluar QR baru!)
         if (!isRegistered) {
           reconnectAttempts++;
           if (reconnectAttempts >= 2) {
@@ -435,7 +457,7 @@ app.get('/', (req, res) => {
   const uptimeSeconds = Math.floor((Date.now() - serverStartTime) / 1000);
   res.json({
     engine: 'Axa Xyz WhatsApp Financial Microservice',
-    version: '3.6.5-SocketIO',
+    version: '3.6.6-CryptoFixed',
     status: 'ONLINE',
     uptimeSeconds,
     connectionStatus,
